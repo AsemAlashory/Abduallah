@@ -16,6 +16,7 @@ class Candle(BaseModel):
 class StrategyParameters(BaseModel):
     major_length: int = Field(default=50, ge=10, le=500)
     internal_length: int = Field(default=20, ge=1, le=250)
+    n_candles: int = Field(default=2, ge=1, le=20)
     break_confirmation: Literal["close"] = "close"
     min_fvg_size: float = Field(default=0.0, ge=0.0)
     retest_tolerance_pct: float = Field(default=0.0015, ge=0.0, le=0.02)
@@ -26,6 +27,8 @@ class StrategyParameters(BaseModel):
 
 class AnalyzeRequest(BaseModel):
     candles: List[Candle]
+    weekly_candles: Optional[List[Candle]] = None
+    daily_candles: Optional[List[Candle]] = None
     external_candles: Optional[List[Candle]] = None
     internal_candles: Optional[List[Candle]] = None
     micro_candles: Optional[List[Candle]] = None
@@ -48,6 +51,8 @@ class AnalyzeResponse(BaseModel):
     ranges: List[Dict]
     pois: List[Dict]
     liquidity_targets: List[Dict]
+    phase_1: Dict = {}
+    stop_hunts: List[Dict] = []
     strategy_state: Dict
     setups: List[Dict]
     movement_legs: List[Dict] = []

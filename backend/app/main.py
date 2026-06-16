@@ -39,6 +39,8 @@ def analyze(payload: AnalyzeRequest) -> AnalyzeResponse:
     result = run_analysis(
         candles=[c.model_dump() for c in payload.candles],
         params=payload.parameters.model_dump(),
+        weekly_candles=[c.model_dump() for c in payload.weekly_candles] if payload.weekly_candles else None,
+        daily_candles=[c.model_dump() for c in payload.daily_candles] if payload.daily_candles else None,
         external_candles=[c.model_dump() for c in payload.external_candles] if payload.external_candles else None,
         internal_candles=[c.model_dump() for c in payload.internal_candles] if payload.internal_candles else None,
         micro_candles=[c.model_dump() for c in payload.micro_candles] if payload.micro_candles else None,
