@@ -9,7 +9,7 @@ import requests
 import yfinance as yf
 
 
-_BINANCE_INTERVALS = {"1m", "5m", "15m", "30m", "1h", "4h", "1d"}
+_BINANCE_INTERVALS = {"1m", "5m", "15m", "30m", "1h", "4h", "1d", "1w"}
 
 
 def _normalize_symbol(symbol: str) -> str:
@@ -33,6 +33,8 @@ def _period_to_limit(period: str) -> int:
 
 
 def _to_binance_interval(interval: str) -> str:
+    if interval == "1wk":
+        return "1w"
     return "1h" if interval == "60m" else interval
 
 

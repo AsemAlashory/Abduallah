@@ -44,6 +44,7 @@ class StrategyEngine:
         self.stop_hunts: list[dict] = []
         self.external_events: list[dict] = []
         self.internal_events: list[dict] = []
+        self.phase1_shift_events: list[dict] = []
         self.external_sweeps: list[dict] = []
         self.internal_sweeps: list[dict] = []
         self.external_idms: list[dict] = []
@@ -66,16 +67,33 @@ class StrategyEngine:
 
         swing_length = int(self.params.get("n_candles", self.params.get("swing_length", 2)) or 2)
         swing_length = max(1, swing_length)
-        trend_df, trend_timeframe, trend_source = self._trend_engine_source()
+        self.phase1_shift_events = []
+        trend_components: list[dict] = []
+        for trend_df, trend_timeframe, trend_source in self._trend_engine_sources():
+            component_swings = self._detect_phase1_swings(
+                trend_df,
+                tier="trend",
+                timeframe=trend_timeframe,
+                length=swing_length,
+            )
+            component_events, _, _ = self._detect_phase1_structure(trend_df, component_swings, trend_timeframe)
+            component_bias = self._derive_phase1_bias(trend_df, component_swings, component_events)
+            self._score_phase1_swings(component_swings, trend_df, component_events, trend_timeframe)
+            self.trend_swings.extend(component_swings)
+            self.trend_events.extend(component_events)
+            trend_components.append(
+                {
+                    "timeframe": trend_timeframe,
+                    "source": trend_source,
+                    "bias": component_bias or "neutral",
+                    "swings": len(component_swings),
+                    "events": len(component_events),
+                }
+            )
 
-        self.trend_swings = self._detect_phase1_swings(
-            trend_df,
-            tier="trend",
-            timeframe=trend_timeframe,
-            length=swing_length,
-        )
-        self.trend_events, trend_stop_hunts = self._detect_phase1_structure(trend_df, self.trend_swings, trend_timeframe)
-        trend_direction = self._derive_phase1_bias(trend_df, self.trend_swings, self.trend_events)
+        trend_direction = self._combine_trend_biases(trend_components)
+        trend_timeframe = "+".join(component["timeframe"] for component in trend_components) if trend_components else "daily"
+        trend_source = "+".join(component["source"] for component in trend_components) if trend_components else "fallback_market_data_no_daily_weekly"
 
         self.external_swings = self._detect_phase1_swings(
             self.external_df,
@@ -90,15 +108,15 @@ class StrategyEngine:
             length=swing_length,
         )
 
-        self.external_events, external_stop_hunts = self._detect_phase1_structure(self.external_df, self.external_swings, "external_4h")
-        self.internal_events, internal_stop_hunts = self._detect_phase1_structure(self.internal_df, self.internal_swings, "internal_1h")
-        self.stop_hunts = trend_stop_hunts + external_stop_hunts + internal_stop_hunts
+        self.external_events, external_stop_hunts, external_shifts = self._detect_phase1_structure(self.external_df, self.external_swings, "external_4h")
+        self.internal_events, internal_stop_hunts, internal_shifts = self._detect_phase1_structure(self.internal_df, self.internal_swings, "internal_1h")
+        self.phase1_shift_events.extend(external_shifts + internal_shifts)
+        self.stop_hunts = external_stop_hunts + internal_stop_hunts
 
         structure_bias = self._derive_phase1_bias(self.external_df, self.external_swings, self.external_events)
         if structure_bias is None:
             structure_bias = self._derive_phase1_bias(self.internal_df, self.internal_swings, self.internal_events)
 
-        self._score_phase1_swings(self.trend_swings, trend_df, self.trend_events, trend_timeframe)
         self._score_phase1_swings(self.external_swings, self.external_df, self.external_events, "external_4h")
         self._score_phase1_swings(self.internal_swings, self.internal_df, self.internal_events, "internal_1h")
         self._classify_phase1_swing_scopes()
@@ -108,6 +126,7 @@ class StrategyEngine:
             structure_bias=structure_bias,
             trend_timeframe=trend_timeframe,
             trend_source=trend_source,
+            trend_components=trend_components,
         )
         self.strategy_state = self.phase_1_state
 
@@ -187,14 +206,23 @@ class StrategyEngine:
                 "phase": 1,
                 "phase_name": "Structure Foundation",
                 "trend_direction": "NEUTRAL",
+                "trend_components": [],
                 "structure_bias": "NEUTRAL",
                 "last_bos": None,
                 "current_external_swing": {"high": None, "low": None},
+                "protected_high": None,
+                "protected_low": None,
                 "activeWeakHighs": [],
                 "activeWeakLows": [],
+                "strongHighs": [],
+                "strongLows": [],
                 "currentLegType": "WEAK",
                 "poi_allowed": False,
                 "shift_detected": False,
+                "latest_shift": None,
+                "latest_choch": None,
+                "shift_events": [],
+                "choch_requires_shift": True,
                 "swing_strength_map": {},
                 "gate_status": "blocked",
                 "gate_reason": "no_market_data",
@@ -203,11 +231,16 @@ class StrategyEngine:
                     "structure_bias": "NEUTRAL",
                     "last_bos": None,
                     "current_external_swing": {"high": None, "low": None},
+                    "protected_high": None,
+                    "protected_low": None,
                     "activeWeakHighs": [],
                     "activeWeakLows": [],
+                    "strongHighs": [],
+                    "strongLows": [],
                     "currentLegType": "WEAK",
                     "poi_allowed": False,
                     "shift_detected": False,
+                    "latest_shift": None,
                     "swing_strength_map": {},
                 },
             },
@@ -216,14 +249,23 @@ class StrategyEngine:
                 "phase": 1,
                 "phase_name": "Structure Foundation",
                 "trend_direction": "NEUTRAL",
+                "trend_components": [],
                 "structure_bias": "NEUTRAL",
                 "last_bos": None,
                 "current_external_swing": {"high": None, "low": None},
+                "protected_high": None,
+                "protected_low": None,
                 "activeWeakHighs": [],
                 "activeWeakLows": [],
+                "strongHighs": [],
+                "strongLows": [],
                 "currentLegType": "WEAK",
                 "poi_allowed": False,
                 "shift_detected": False,
+                "latest_shift": None,
+                "latest_choch": None,
+                "shift_events": [],
+                "choch_requires_shift": True,
                 "swing_strength_map": {},
                 "gate_status": "blocked",
                 "gate_reason": "no_market_data",
@@ -258,17 +300,30 @@ class StrategyEngine:
         df["timestamp"] = df["_time"].dt.strftime("%Y-%m-%dT%H:%M:%SZ")
         return df
 
-    def _trend_engine_source(self) -> tuple[pd.DataFrame, str, str]:
-        if not self.weekly_df.empty:
-            return self.weekly_df, "weekly", "OHLC_Weekly"
-        if not self.daily_df.empty:
-            return self.daily_df, "daily", "OHLC_Daily"
+    def _trend_engine_sources(self) -> list[tuple[pd.DataFrame, str, str]]:
+        sources: list[tuple[pd.DataFrame, str, str]] = []
+        market_source = self.external_df if not self.external_df.empty else self.internal_df
 
-        source = self.external_df if not self.external_df.empty else self.internal_df
-        derived_daily = self._resample_ohlc(source, "1D")
-        if not derived_daily.empty:
-            return derived_daily, "daily", "derived_daily_from_market_data"
-        return source, "daily", "fallback_market_data_no_daily_weekly"
+        weekly = self.weekly_df if not self.weekly_df.empty else self._resample_ohlc(market_source, "1W")
+        daily = self.daily_df if not self.daily_df.empty else self._resample_ohlc(market_source, "1D")
+
+        if not weekly.empty:
+            sources.append((weekly, "weekly", "OHLC_Weekly" if not self.weekly_df.empty else "derived_weekly_from_market_data"))
+        if not daily.empty:
+            sources.append((daily, "daily", "OHLC_Daily" if not self.daily_df.empty else "derived_daily_from_market_data"))
+        if not sources and not market_source.empty:
+            sources.append((market_source, "daily", "fallback_market_data_no_daily_weekly"))
+        return sources
+
+    def _combine_trend_biases(self, components: list[dict]) -> Optional[Direction]:
+        weekly = next((c.get("bias") for c in components if c.get("timeframe") == "weekly"), None)
+        daily = next((c.get("bias") for c in components if c.get("timeframe") == "daily"), None)
+        weekly_bias = weekly if weekly in ("bullish", "bearish") else None
+        daily_bias = daily if daily in ("bullish", "bearish") else None
+
+        if weekly_bias and daily_bias:
+            return weekly_bias if weekly_bias == daily_bias else weekly_bias
+        return weekly_bias or daily_bias
 
     def _resample_ohlc(self, df: pd.DataFrame, rule: str) -> pd.DataFrame:
         if df.empty or "_time" not in df:
@@ -350,18 +405,66 @@ class StrategyEngine:
 
         return sorted(swings, key=lambda x: (x["index"], x["kind"]))
 
-    def _detect_phase1_structure(self, df: pd.DataFrame, swings: list[dict], timeframe: str) -> tuple[list[dict], list[dict]]:
+    def _detect_phase1_structure(self, df: pd.DataFrame, swings: list[dict], timeframe: str) -> tuple[list[dict], list[dict], list[dict]]:
         events: list[dict] = []
         stop_hunts: list[dict] = []
+        shift_events: list[dict] = []
         bias: Optional[Direction] = None
         broken_swing_ids: set[str] = set()
         stop_hunt_keys: set[tuple[str, int]] = set()
+        processed_shift_swing_ids: set[str] = set()
+        pending_shift: Optional[dict] = None
 
         if df.empty:
-            return events, stop_hunts
+            return events, stop_hunts, shift_events
+
+        def register_shift(swing: dict, protected: dict, direction: Direction, index: int, row: pd.Series) -> dict:
+            record = {
+                "index": int(swing["index"]),
+                "source_index": int(index),
+                "timestamp": swing["timestamp"],
+                "confirmation_index": int(index),
+                "confirmation_timestamp": row["timestamp"],
+                "event": "Shift",
+                "direction": direction,
+                "timeframe": timeframe,
+                "swing_id": swing.get("id"),
+                "swing_index": int(swing["index"]),
+                "swing_timestamp": swing["timestamp"],
+                "swing_kind": swing["kind"],
+                "swing_label": swing.get("label"),
+                "weak_level": float(swing["price"]),
+                "protected_structure": self._phase1_structure_point(protected),
+                "protected_level": float(protected["price"]),
+                "produces": "Weak High" if swing["kind"] == "high" else "Weak Low",
+                "reason": "price protected the prior high/low instead of breaking it; CHoCH can only be confirmed after this shift is confirmed",
+            }
+            shift_events.append(record)
+            return record
+
+        def reject_shiftless_counter_break(swing: dict, direction: Direction, index: int, row: pd.Series) -> None:
+            key = (str(swing.get("id")), int(index))
+            if key in stop_hunt_keys:
+                return
+            stop_hunt_keys.add(key)
+            stop_hunts.append(
+                {
+                    "index": int(index),
+                    "timestamp": row["timestamp"],
+                    "direction": direction,
+                    "tested_level": float(swing["price"]),
+                    "swing_id": swing.get("id"),
+                    "swing_index": int(swing["index"]),
+                    "timeframe": timeframe,
+                    "updates_structure": False,
+                    "classification": "invalid_counter_break_without_shift",
+                    "reason": "opposite-direction structure break was rejected because Phase 1 requires a confirmed Shift before CHoCH",
+                }
+            )
 
         for i, row in df.iterrows():
             confirmed = [s for s in swings if int(s["confirmed_after"]) <= int(i)]
+            newly_confirmed = [s for s in confirmed if int(s["confirmed_after"]) == int(i)]
             available_highs = [s for s in confirmed if s["kind"] == "high" and s["id"] not in broken_swing_ids]
             available_lows = [s for s in confirmed if s["kind"] == "low" and s["id"] not in broken_swing_ids]
             last_high = available_highs[-1] if available_highs else None
@@ -370,14 +473,36 @@ class StrategyEngine:
             if last_high is None or last_low is None:
                 continue
 
+            for swing in newly_confirmed:
+                swing_id = str(swing.get("id"))
+                if swing_id in processed_shift_swing_ids:
+                    continue
+                if bias == "bullish" and swing["kind"] == "high":
+                    prior_highs = [s for s in confirmed if s["kind"] == "high" and int(s["index"]) < int(swing["index"])]
+                    protected = prior_highs[-1] if prior_highs else None
+                    if protected and float(swing["price"]) <= float(protected["price"]):
+                        pending_shift = register_shift(swing, protected, "bearish", int(i), row)
+                        processed_shift_swing_ids.add(swing_id)
+                elif bias == "bearish" and swing["kind"] == "low":
+                    prior_lows = [s for s in confirmed if s["kind"] == "low" and int(s["index"]) < int(swing["index"])]
+                    protected = prior_lows[-1] if prior_lows else None
+                    if protected and float(swing["price"]) >= float(protected["price"]):
+                        pending_shift = register_shift(swing, protected, "bullish", int(i), row)
+                        processed_shift_swing_ids.add(swing_id)
+
             prev_close = float(df.iloc[i - 1]["close"]) if i > 0 else float(row["close"])
             close = float(row["close"])
-            high_broken = bool(prev_close <= float(last_high["price"]) and close > float(last_high["price"]))
-            low_broken = bool(prev_close >= float(last_low["price"]) and close < float(last_low["price"]))
+            high_broken = bool(close > float(last_high["price"]) and last_high["id"] not in broken_swing_ids)
+            low_broken = bool(close < float(last_low["price"]) and last_low["id"] not in broken_swing_ids)
 
             if high_broken:
                 continuation = self._break_continuation(df, int(i), "bullish", float(last_high["price"]))
                 if continuation["confirmed"]:
+                    shift_context = pending_shift if pending_shift and pending_shift.get("direction") == "bullish" else None
+                    if bias not in (None, "bullish") and shift_context is None:
+                        reject_shiftless_counter_break(last_high, "bullish", int(i), row)
+                        broken_swing_ids.add(last_high["id"])
+                        continue
                     event_type = "BOS" if bias in (None, "bullish") else "CHoCH"
                     responsible = self._phase1_structure_point(last_low)
                     events.append(
@@ -403,10 +528,18 @@ class StrategyEngine:
                             "confirmation_timestamp": continuation["confirmation_timestamp"],
                             "continuation_score": continuation["quality"],
                             "shift_detected": event_type == "CHoCH",
+                            "shift_required": event_type == "CHoCH",
+                            "shift": shift_context,
+                            "shift_index": shift_context.get("index") if shift_context else None,
+                            "shift_timestamp": shift_context.get("timestamp") if shift_context else None,
                         }
                     )
                     broken_swing_ids.add(last_high["id"])
                     bias = "bullish"
+                    if pending_shift and pending_shift.get("direction") == "bearish":
+                        pending_shift = None
+                    if event_type == "CHoCH":
+                        pending_shift = None
                 else:
                     key = (last_high["id"], int(i))
                     if key not in stop_hunt_keys:
@@ -416,6 +549,11 @@ class StrategyEngine:
             if low_broken:
                 continuation = self._break_continuation(df, int(i), "bearish", float(last_low["price"]))
                 if continuation["confirmed"]:
+                    shift_context = pending_shift if pending_shift and pending_shift.get("direction") == "bearish" else None
+                    if bias not in (None, "bearish") and shift_context is None:
+                        reject_shiftless_counter_break(last_low, "bearish", int(i), row)
+                        broken_swing_ids.add(last_low["id"])
+                        continue
                     event_type = "BOS" if bias in (None, "bearish") else "CHoCH"
                     responsible = self._phase1_structure_point(last_high)
                     events.append(
@@ -441,17 +579,25 @@ class StrategyEngine:
                             "confirmation_timestamp": continuation["confirmation_timestamp"],
                             "continuation_score": continuation["quality"],
                             "shift_detected": event_type == "CHoCH",
+                            "shift_required": event_type == "CHoCH",
+                            "shift": shift_context,
+                            "shift_index": shift_context.get("index") if shift_context else None,
+                            "shift_timestamp": shift_context.get("timestamp") if shift_context else None,
                         }
                     )
                     broken_swing_ids.add(last_low["id"])
                     bias = "bearish"
+                    if pending_shift and pending_shift.get("direction") == "bullish":
+                        pending_shift = None
+                    if event_type == "CHoCH":
+                        pending_shift = None
                 else:
                     key = (last_low["id"], int(i))
                     if key not in stop_hunt_keys:
                         stop_hunt_keys.add(key)
                         stop_hunts.append(self._phase1_stop_hunt_record(row, int(i), last_low, "bearish", timeframe))
 
-        return events, stop_hunts
+        return events, stop_hunts, shift_events
 
     def _phase1_structure_point(self, swing: dict) -> dict:
         return {
@@ -510,12 +656,14 @@ class StrategyEngine:
                 confirmation_index = j
 
         progress_ok = best_progress >= threshold
-        confirmed = bool(progress_ok)
+        confirmed = bool(progress_ok or displacement_ok)
+        if displacement_ok and confirmation_index == break_index:
+            best_progress = max(best_progress, threshold)
         quality = 0.0
         if confirmed:
             displacement_quality = min(body / max(avg_body * 1.5, 1e-9), 1.0) if displacement_ok else 0.0
             progress_quality = min(best_progress / max(threshold * 2.0, 1e-9), 1.0) if progress_ok else 0.0
-            quality = max(progress_quality, displacement_quality * 0.5, 0.55)
+            quality = max(progress_quality, displacement_quality, 0.55)
 
         return {
             "confirmed": confirmed,
@@ -569,7 +717,7 @@ class StrategyEngine:
             body_broken = swing_id in broken_by
             produced_events = produced_by.get(swing_id, [])
             bos_produced = bool(produced_events)
-            score_ready = bool(body_broken or bos_produced)
+            score_ready = bool(bos_produced)
             move_score = self._phase1_move_size_score(df, swing, median_range) if score_ready else 0.0
             continuation_quality = max([float(event.get("continuation_score", 0.0) or 0.0) for event in produced_events] or [0.0])
             structural_impact = self._phase1_timeframe_weight(timeframe) if bos_produced else 0.0
@@ -608,9 +756,9 @@ class StrategyEngine:
                     "score_ready": score_ready,
                     "strength_class": strength_class,
                     "structure_role": role,
-                    "valid_swing": bool(liquidity_taken and (body_broken or bos_produced)),
-                    "validation_status": "valid" if liquidity_taken and (body_broken or bos_produced) else "pending_or_invalid",
-                    "is_active_weak": role.startswith("WEAK_") and not body_broken,
+                    "valid_swing": bool(liquidity_taken and bos_produced),
+                    "validation_status": "valid" if liquidity_taken and bos_produced else "pending_or_invalid",
+                    "is_active_weak": role.startswith("WEAK_") and not body_broken and not liquidity_taken,
                     "score_weights": {
                         "liquidity_taken": 0.25,
                         "move_size": 0.20,
@@ -662,7 +810,9 @@ class StrategyEngine:
             swing["structure_scope"] = "Trend"
 
         for swing in self.external_swings:
-            swing["structure_scope"] = "External" if swing.get("bos_produced") else "Internal"
+            is_external = bool(swing.get("bos_produced"))
+            swing["structure_scope"] = "External" if is_external else "Internal"
+            swing["structure_scope_reason"] = "confirmed_bos_producer" if is_external else "waiting_for_confirmed_bos"
 
         for swing in self.internal_swings:
             inside_external = False
@@ -693,13 +843,58 @@ class StrategyEngine:
             )
         return sorted(records, key=lambda x: (str(x["timeframe"]), int(x["index"])))
 
-    def _current_external_swing(self) -> dict:
-        highs = [s for s in self.external_swings if s["kind"] == "high"]
-        lows = [s for s in self.external_swings if s["kind"] == "low"]
+    def _phase1_strong_levels(self, kind: Literal["high", "low"]) -> list[dict]:
+        target_role = f"STRONG_{kind.upper()}"
+        records: list[dict] = []
+        for swing in self.external_swings + self.internal_swings:
+            if swing.get("kind") != kind or swing.get("structure_role") != target_role:
+                continue
+            records.append(
+                {
+                    "id": swing.get("id"),
+                    "index": swing.get("index"),
+                    "timestamp": swing.get("timestamp"),
+                    "level": float(swing.get("price")),
+                    "kind": swing.get("kind"),
+                    "label": swing.get("label"),
+                    "timeframe": swing.get("timeframe"),
+                    "structure_scope": swing.get("structure_scope"),
+                    "strength_score": swing.get("strength_score"),
+                    "strength_class": swing.get("strength_class"),
+                    "role": swing.get("structure_role"),
+                    "bos_produced": bool(swing.get("bos_produced")),
+                }
+            )
+        return sorted(records, key=lambda x: (str(x["timeframe"]), int(x["index"])))
+
+    def _protected_phase1_levels(self, structure_bias: Optional[Direction], current_external_swing: dict) -> dict:
+        high = current_external_swing.get("high")
+        low = current_external_swing.get("low")
         return {
-            "high": highs[-1] if highs else None,
-            "low": lows[-1] if lows else None,
+            "protected_high": high if structure_bias == "bearish" else None,
+            "protected_low": low if structure_bias == "bullish" else None,
+            "protected_high_level": float(high["price"]) if structure_bias == "bearish" and high else None,
+            "protected_low_level": float(low["price"]) if structure_bias == "bullish" and low else None,
         }
+
+    def _current_external_swing(self) -> dict:
+        strong_high = next(
+            (
+                swing
+                for swing in reversed(self.external_swings)
+                if swing.get("kind") == "high" and swing.get("bos_produced")
+            ),
+            None,
+        )
+        strong_low = next(
+            (
+                swing
+                for swing in reversed(self.external_swings)
+                if swing.get("kind") == "low" and swing.get("bos_produced")
+            ),
+            None,
+        )
+        return {"high": strong_high, "low": strong_low}
 
     def _current_leg_type(self) -> tuple[str, Optional[dict], Optional[dict]]:
         events = self.internal_events or self.external_events
@@ -734,25 +929,70 @@ class StrategyEngine:
             "confirmed": True,
         }
 
+    def _phase1_df_for_timeframe(self, timeframe: Optional[str]) -> pd.DataFrame:
+        if timeframe == "external_4h":
+            return self.external_df
+        if timeframe == "internal_1h":
+            return self.internal_df
+        return self.df
+
+    def _is_phase1_shift_active(self, latest_shift: Optional[dict], structure_events: list[dict]) -> bool:
+        if not latest_shift:
+            return False
+
+        shift_confirmed_at = str(latest_shift.get("confirmation_timestamp") or latest_shift.get("timestamp") or "")
+        for event in structure_events:
+            event_time = str(event.get("confirmation_timestamp") or event.get("timestamp") or "")
+            if event_time and shift_confirmed_at and event_time >= shift_confirmed_at:
+                return False
+
+        timeframe = latest_shift.get("timeframe")
+        df = self._phase1_df_for_timeframe(timeframe if isinstance(timeframe, str) else None)
+        if df.empty:
+            return False
+
+        valid_bars = int(self.params.get("shift_valid_bars", self.params.get("n_candles", 2)) or 2)
+        valid_bars = max(0, valid_bars)
+        confirmation_index = int(latest_shift.get("confirmation_index", latest_shift.get("index", len(df) - 1)))
+        return 0 <= (len(df) - 1 - confirmation_index) <= valid_bars
+
     def _build_phase1_state(
         self,
         trend_direction: Optional[Direction],
         structure_bias: Optional[Direction],
         trend_timeframe: str,
         trend_source: str,
+        trend_components: Optional[list[dict]] = None,
     ) -> dict:
         current_leg_type, latest_leg_event, responsible_swing = self._current_leg_type()
         poi_allowed = current_leg_type == "STRUCTURAL"
         gate_reason = self._phase1_gate_reason(current_leg_type)
-        all_swings = self.trend_swings + self.external_swings + self.internal_swings
-        all_events = self.trend_events + self.external_events + self.internal_events
-        last_bos = next((event for event in reversed(all_events) if event.get("event") == "BOS"), None)
-        latest_shift = next((event for event in reversed(all_events) if event.get("event") == "CHoCH"), None)
+        structure_swings = self.external_swings + self.internal_swings
+        structure_events = self.external_events + self.internal_events
+        last_bos = next((event for event in reversed(structure_events) if event.get("event") == "BOS"), None)
+        shift_events = sorted(self.phase1_shift_events, key=lambda x: (str(x.get("timestamp", "")), int(x.get("index", 0))))
+        latest_shift = shift_events[-1] if shift_events else None
+        latest_choch = next((event for event in reversed(structure_events) if event.get("event") == "CHoCH"), None)
         last_bos_output = self._phase1_last_bos_output(last_bos)
         current_external_swing = self._current_external_swing()
         active_weak_highs = self._active_phase1_weak_levels("high")
         active_weak_lows = self._active_phase1_weak_levels("low")
-        swing_strength_map = {str(s["id"]): s.get("strength_score", 0.0) for s in all_swings if s.get("id")}
+        strong_highs = self._phase1_strong_levels("high")
+        strong_lows = self._phase1_strong_levels("low")
+        protected_levels = self._protected_phase1_levels(structure_bias, current_external_swing)
+        shift_detected = self._is_phase1_shift_active(latest_shift, structure_events)
+        swing_strength_map = {
+            str(s["id"]): {
+                "score": s.get("strength_score", 0.0),
+                "class": s.get("strength_class", "MINOR"),
+                "liquidity_taken": bool(s.get("liquidity_taken")),
+                "bos_produced": bool(s.get("bos_produced")),
+                "continuation_quality": s.get("continuation_quality", 0.0),
+                "structural_impact": s.get("structural_impact_score", 0.0),
+            }
+            for s in structure_swings
+            if s.get("id")
+        }
 
         return {
             "phase": 1,
@@ -760,20 +1000,30 @@ class StrategyEngine:
             "trend_direction": (trend_direction or "neutral").upper(),
             "trend_timeframe": trend_timeframe,
             "trend_source": trend_source,
+            "trend_components": trend_components or [],
             "structure_bias": (structure_bias or "neutral").upper(),
             "last_bos": last_bos_output,
             "last_bos_event": last_bos,
             "current_external_swing": current_external_swing,
+            "protected_high": protected_levels["protected_high"],
+            "protected_low": protected_levels["protected_low"],
+            "protected_high_level": protected_levels["protected_high_level"],
+            "protected_low_level": protected_levels["protected_low_level"],
             "activeWeakHighs": active_weak_highs,
             "activeWeakLows": active_weak_lows,
+            "strongHighs": strong_highs,
+            "strongLows": strong_lows,
             "currentLegType": current_leg_type,
             "current_leg_type": current_leg_type,
             "poi_allowed": poi_allowed,
             "poi_allowed_meaning": "green/red permission only; Phase 1 never builds or calculates POI zones",
             "gate_status": "open" if poi_allowed else "blocked",
             "gate_reason": gate_reason,
-            "shift_detected": latest_shift is not None,
+            "shift_detected": shift_detected,
             "latest_shift": latest_shift,
+            "latest_choch": latest_choch,
+            "shift_events": shift_events,
+            "choch_requires_shift": True,
             "mss_detected": False,
             "mss_events": [],
             "mss_note": "MSS depends on Phase 2 Sweep context and is not activated inside Phase 1 alone",
@@ -785,11 +1035,16 @@ class StrategyEngine:
                 "structure_bias": (structure_bias or "neutral").upper(),
                 "last_bos": last_bos_output,
                 "current_external_swing": current_external_swing,
+                "protected_high": protected_levels["protected_high"],
+                "protected_low": protected_levels["protected_low"],
                 "activeWeakHighs": active_weak_highs,
                 "activeWeakLows": active_weak_lows,
+                "strongHighs": strong_highs,
+                "strongLows": strong_lows,
                 "currentLegType": current_leg_type,
                 "poi_allowed": poi_allowed,
-                "shift_detected": latest_shift is not None,
+                "shift_detected": shift_detected,
+                "latest_shift": latest_shift,
                 "swing_strength_map": swing_strength_map,
             },
             "swing_strength_map": swing_strength_map,
@@ -797,9 +1052,11 @@ class StrategyEngine:
             "trend_events": self.trend_events,
             "stop_hunts": self.stop_hunts,
             "rules_applied": [
-                "Trend Engine is independent and uses Weekly/Daily structure when supplied or derived",
+                "Trend Engine combines Weekly and Daily direction when supplied or derived",
                 "Swing Detection uses local highs/lows with N candles on both sides",
                 "BOS/CHoCH require candle-body close plus continuation",
+                "A strong displacement candle can confirm BOS immediately without waiting for a delayed redraw",
+                "CHoCH is only labeled when a protected high/low created a prior Shift",
                 "A break without continuation is classified as Stop Hunt and does not update structure",
                 "Weak Leg blocks Phase 3; Structural Leg sets poi_allowed=true",
                 "Phase 1 does not build Sweep, Range, IDM, Liquidity, POI, ABC, or Entry outputs",
