@@ -356,23 +356,23 @@ class StrategyEngine:
 
         last_high_price: Optional[float] = None
         last_low_price: Optional[float] = None
+        highs = df["high"].astype(float).to_numpy()
+        lows = df["low"].astype(float).to_numpy()
+        timestamps = df["timestamp"].tolist()
 
         for i in range(length, len(df) - length):
-            row = df.iloc[i]
-            left = df.iloc[i - length : i]
-            right = df.iloc[i + 1 : i + length + 1]
-            high = float(row["high"])
-            low = float(row["low"])
+            high = float(highs[i])
+            low = float(lows[i])
             confirmed_after = int(i + length)
 
-            if high > float(left["high"].max()) and high > float(right["high"].max()):
+            if high > float(highs[i - length : i].max()) and high > float(highs[i + 1 : i + length + 1].max()):
                 label = "HH" if last_high_price is None or high > last_high_price else "LH"
                 last_high_price = high
                 swings.append(
                     {
                         "id": f"{timeframe}:high:{i}",
                         "index": int(i),
-                        "timestamp": row["timestamp"],
+                        "timestamp": timestamps[i],
                         "price": high,
                         "kind": "high",
                         "label": label,
@@ -384,14 +384,14 @@ class StrategyEngine:
                     }
                 )
 
-            if low < float(left["low"].min()) and low < float(right["low"].min()):
+            if low < float(lows[i - length : i].min()) and low < float(lows[i + 1 : i + length + 1].min()):
                 label = "LL" if last_low_price is not None and low < last_low_price else "HL"
                 last_low_price = low
                 swings.append(
                     {
                         "id": f"{timeframe}:low:{i}",
                         "index": int(i),
-                        "timestamp": row["timestamp"],
+                        "timestamp": timestamps[i],
                         "price": low,
                         "kind": "low",
                         "label": label,
@@ -462,11 +462,39 @@ class StrategyEngine:
                 }
             )
 
-        for i, row in df.iterrows():
-            confirmed = [s for s in swings if int(s["confirmed_after"]) <= int(i)]
-            newly_confirmed = [s for s in confirmed if int(s["confirmed_after"]) == int(i)]
-            available_highs = [s for s in confirmed if s["kind"] == "high" and s["id"] not in broken_swing_ids]
-            available_lows = [s for s in confirmed if s["kind"] == "low" and s["id"] not in broken_swing_ids]
+        confirmation_map: dict[int, list[dict]] = {}
+        for swing in swings:
+            confirmation_index = int(swing["confirmed_after"])
+            if 0 <= confirmation_index < len(df):
+                confirmation_map.setdefault(confirmation_index, []).append(swing)
+
+        all_confirmed_highs: list[dict] = []
+        all_confirmed_lows: list[dict] = []
+        available_highs: list[dict] = []
+        available_lows: list[dict] = []
+        closes = df["close"].astype(float).to_numpy()
+
+        def latest_prior_swing(candidates: list[dict], swing: dict) -> Optional[dict]:
+            swing_index = int(swing["index"])
+            return next((candidate for candidate in reversed(candidates) if int(candidate["index"]) < swing_index), None)
+
+        def discard_broken_tail(candidates: list[dict]) -> None:
+            while candidates and str(candidates[-1].get("id")) in broken_swing_ids:
+                candidates.pop()
+
+        for i in range(len(df)):
+            row = df.iloc[i]
+            newly_confirmed = confirmation_map.get(int(i), [])
+            for swing in newly_confirmed:
+                if swing["kind"] == "high":
+                    all_confirmed_highs.append(swing)
+                    available_highs.append(swing)
+                else:
+                    all_confirmed_lows.append(swing)
+                    available_lows.append(swing)
+
+            discard_broken_tail(available_highs)
+            discard_broken_tail(available_lows)
             last_high = available_highs[-1] if available_highs else None
             last_low = available_lows[-1] if available_lows else None
 
@@ -478,20 +506,17 @@ class StrategyEngine:
                 if swing_id in processed_shift_swing_ids:
                     continue
                 if bias == "bullish" and swing["kind"] == "high":
-                    prior_highs = [s for s in confirmed if s["kind"] == "high" and int(s["index"]) < int(swing["index"])]
-                    protected = prior_highs[-1] if prior_highs else None
+                    protected = latest_prior_swing(all_confirmed_highs, swing)
                     if protected and float(swing["price"]) <= float(protected["price"]):
                         pending_shift = register_shift(swing, protected, "bearish", int(i), row)
                         processed_shift_swing_ids.add(swing_id)
                 elif bias == "bearish" and swing["kind"] == "low":
-                    prior_lows = [s for s in confirmed if s["kind"] == "low" and int(s["index"]) < int(swing["index"])]
-                    protected = prior_lows[-1] if prior_lows else None
+                    protected = latest_prior_swing(all_confirmed_lows, swing)
                     if protected and float(swing["price"]) >= float(protected["price"]):
                         pending_shift = register_shift(swing, protected, "bullish", int(i), row)
                         processed_shift_swing_ids.add(swing_id)
 
-            prev_close = float(df.iloc[i - 1]["close"]) if i > 0 else float(row["close"])
-            close = float(row["close"])
+            close = float(closes[i])
             high_broken = bool(close > float(last_high["price"]) and last_high["id"] not in broken_swing_ids)
             low_broken = bool(close < float(last_low["price"]) and last_low["id"] not in broken_swing_ids)
 

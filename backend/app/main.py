@@ -4,6 +4,7 @@ from typing import Any, Optional
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 
 from app.schemas.alerts import AlertConfig, AlertEvent, AlertLogResponse
 from app.schemas.analyze import AnalyzeRequest, AnalyzeResponse, HealthResponse
@@ -16,6 +17,8 @@ from app.services.strategy_engine import run_analysis
 
 
 app = FastAPI(title="SMC Strategy Platform", version="0.2.0")
+
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 
 app.add_middleware(
     CORSMiddleware,
