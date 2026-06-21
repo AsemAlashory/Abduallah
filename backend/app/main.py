@@ -38,6 +38,10 @@ def health() -> HealthResponse:
 def analyze(payload: AnalyzeRequest) -> AnalyzeResponse:
     if len(payload.candles) < 40:
         raise HTTPException(status_code=400, detail="At least 40 candles are required for analysis")
+    if not payload.external_candles:
+        raise HTTPException(status_code=400, detail="Phase 1 requires a separate external_candles feed")
+    if not payload.internal_candles:
+        raise HTTPException(status_code=400, detail="Phase 1 requires a separate auto-paired internal_candles feed")
 
     result = run_analysis(
         candles=[c.model_dump() for c in payload.candles],

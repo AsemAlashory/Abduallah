@@ -14,8 +14,8 @@ class Candle(BaseModel):
 
 
 class StrategyParameters(BaseModel):
-    major_length: int = Field(default=50, ge=10, le=500)
-    internal_length: int = Field(default=20, ge=1, le=250)
+    major_length: int = Field(default=45, ge=1, le=500)
+    internal_length: int = Field(default=45, ge=1, le=500)
     n_candles: int = Field(default=2, ge=1, le=20)
     break_confirmation: Literal["close"] = "close"
     min_fvg_size: float = Field(default=0.0, ge=0.0)
@@ -23,6 +23,9 @@ class StrategyParameters(BaseModel):
     external_erl_target: Optional[float] = None
     external_invalidation_level: Optional[float] = None
     micro_length: int = Field(default=6, ge=2, le=80)
+    external_timeframe: str = "4h"
+    internal_timeframe: str = "1h"
+    chart_timeframe: str = "4h"
 
 
 class AnalyzeRequest(BaseModel):

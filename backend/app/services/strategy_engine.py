@@ -9,13 +9,22 @@ import pandas as pd
 Direction = Literal["bullish", "bearish"]
 Side = Literal["buy", "sell"]
 
+PHASE1_AUTO_PAIRS = {
+    "1mo": "1d",
+    "1wk": "4h",
+    "1d": "2h",
+    "4h": "1h",
+    "1h": "15m",
+}
+PHASE1_DEFAULT_SWING_LENGTH = 45
+
 
 class StrategyEngine:
     """SMC sweep-range engine based on the client PDF rules.
 
-    The platform can receive true external/internal feeds. When only one feed is
-    supplied, the major/internal swing tiers act as the 4H/1H proxy so existing
-    CSV uploads keep working.
+    Phase 1 keeps chart, external, and internal feeds separate. The internal
+    feed is selected by the official auto-pair table and must not silently
+    reuse the chart/external feed.
     """
 
     def __init__(
@@ -30,12 +39,19 @@ class StrategyEngine:
     ):
         self.params = params
         self.lightweight_backtest = bool(params.get("_lightweight_backtest"))
-        self.internal_df = self._prepare_df(internal_candles or candles)
-        self.external_df = self._prepare_df(external_candles or candles)
+        self.chart_df = self._prepare_df(candles)
+        self.external_timeframe_label = self._clean_timeframe_label(params.get("external_timeframe") or params.get("chart_timeframe") or "4h")
+        self.internal_timeframe_label = self._phase1_internal_pair(self.external_timeframe_label)
+        self.chart_timeframe_label = self._clean_timeframe_label(params.get("chart_timeframe") or self.external_timeframe_label)
+        self.internal_df = self._prepare_df(internal_candles or [])
+        self.external_df = self._prepare_df(external_candles or [])
         self.micro_df = self._prepare_df(micro_candles or [])
         self.weekly_df = self._prepare_df(weekly_candles or [])
         self.daily_df = self._prepare_df(daily_candles or [])
-        self.df = self.internal_df
+        self.df = self.chart_df
+        self.external_timeframe_key = self._phase1_timeframe_key("external", self.external_timeframe_label)
+        self.internal_timeframe_key = self._phase1_timeframe_key("internal", self.internal_timeframe_label)
+        self.phase1_swing_settings: dict[str, Any] = {}
 
         self.trend_swings: list[dict] = []
         self.trend_events: list[dict] = []
@@ -65,16 +81,37 @@ class StrategyEngine:
         if self.df.empty:
             return self._empty_result()
 
-        swing_length = int(self.params.get("n_candles", self.params.get("swing_length", 2)) or 2)
-        swing_length = max(1, swing_length)
+        trend_requested_length = int(self.params.get("n_candles", self.params.get("swing_length", 2)) or 2)
+        external_requested_length = int(self.params.get("major_length", PHASE1_DEFAULT_SWING_LENGTH) or PHASE1_DEFAULT_SWING_LENGTH)
+        internal_requested_length = int(self.params.get("internal_length", PHASE1_DEFAULT_SWING_LENGTH) or PHASE1_DEFAULT_SWING_LENGTH)
+        external_length = self._phase1_swing_length(self.external_df, external_requested_length)
+        internal_length = self._phase1_swing_length(self.internal_df, internal_requested_length)
+        self.phase1_swing_settings = {
+            "model": "pine_swings_state_flip",
+            "source_formula": "indicator.pine swings(len): high[len] > ta.highest(len) / low[len] < ta.lowest(len)",
+            "auto_pairing": True,
+            "chart_timeframe": self.chart_timeframe_label,
+            "external_timeframe": self.external_timeframe_label,
+            "internal_timeframe": self.internal_timeframe_label,
+            "external_requested_length": max(1, external_requested_length),
+            "internal_requested_length": max(1, internal_requested_length),
+            "external_used_length": external_length,
+            "internal_used_length": internal_length,
+            "external_candles": len(self.external_df),
+            "internal_candles": len(self.internal_df),
+            "feeds_separated": True,
+            "same_feed_guard": "external/internal feeds are never auto-reused in Phase 1",
+            "trend_requested_length": max(1, trend_requested_length),
+        }
         self.phase1_shift_events = []
         trend_components: list[dict] = []
         for trend_df, trend_timeframe, trend_source in self._trend_engine_sources():
+            trend_length = self._phase1_swing_length(trend_df, trend_requested_length)
             component_swings = self._detect_phase1_swings(
                 trend_df,
                 tier="trend",
                 timeframe=trend_timeframe,
-                length=swing_length,
+                length=trend_length,
             )
             component_events, _, _ = self._detect_phase1_structure(trend_df, component_swings, trend_timeframe)
             component_bias = self._derive_phase1_bias(trend_df, component_swings, component_events)
@@ -98,18 +135,18 @@ class StrategyEngine:
         self.external_swings = self._detect_phase1_swings(
             self.external_df,
             tier="major",
-            timeframe="external_4h",
-            length=swing_length,
+            timeframe=self.external_timeframe_key,
+            length=external_length,
         )
         self.internal_swings = self._detect_phase1_swings(
             self.internal_df,
             tier="internal",
-            timeframe="internal_1h",
-            length=swing_length,
+            timeframe=self.internal_timeframe_key,
+            length=internal_length,
         )
 
-        self.external_events, external_stop_hunts, external_shifts = self._detect_phase1_structure(self.external_df, self.external_swings, "external_4h")
-        self.internal_events, internal_stop_hunts, internal_shifts = self._detect_phase1_structure(self.internal_df, self.internal_swings, "internal_1h")
+        self.external_events, external_stop_hunts, external_shifts = self._detect_phase1_structure(self.external_df, self.external_swings, self.external_timeframe_key)
+        self.internal_events, internal_stop_hunts, internal_shifts = self._detect_phase1_structure(self.internal_df, self.internal_swings, self.internal_timeframe_key)
         self.phase1_shift_events.extend(external_shifts + internal_shifts)
         self.stop_hunts = external_stop_hunts + internal_stop_hunts
 
@@ -117,8 +154,8 @@ class StrategyEngine:
         if structure_bias is None:
             structure_bias = self._derive_phase1_bias(self.internal_df, self.internal_swings, self.internal_events)
 
-        self._score_phase1_swings(self.external_swings, self.external_df, self.external_events, "external_4h")
-        self._score_phase1_swings(self.internal_swings, self.internal_df, self.internal_events, "internal_1h")
+        self._score_phase1_swings(self.external_swings, self.external_df, self.external_events, self.external_timeframe_key)
+        self._score_phase1_swings(self.internal_swings, self.internal_df, self.internal_events, self.internal_timeframe_key)
         self._classify_phase1_swing_scopes()
 
         self.phase_1_state = self._build_phase1_state(
@@ -146,8 +183,8 @@ class StrategyEngine:
         self.movement_legs = []
         self.correction_protocols = []
 
-        swings = self._map_for_chart(self.external_swings, "external_4h") + self._map_for_chart(self.internal_swings, "internal_1h")
-        events = self._map_for_chart(self.external_events, "external_4h") + self._map_for_chart(self.internal_events, "internal_1h")
+        swings = self._map_for_chart(self.external_swings, self.external_timeframe_key) + self._map_for_chart(self.internal_swings, self.internal_timeframe_key)
+        events = self._map_for_chart(self.external_events, self.external_timeframe_key) + self._map_for_chart(self.internal_events, self.internal_timeframe_key)
 
         return {
             "summary": {
@@ -277,6 +314,41 @@ class StrategyEngine:
             "correction_protocols": [],
         }
 
+    def _clean_timeframe_label(self, value: Any) -> str:
+        label = str(value or "").strip().lower().replace(" ", "")
+        aliases = {
+            "": "1h",
+            "60m": "1h",
+            "h1": "1h",
+            "h2": "2h",
+            "h4": "4h",
+            "m15": "15m",
+            "w": "1wk",
+            "1w": "1wk",
+            "week": "1wk",
+            "weekly": "1wk",
+            "month": "1mo",
+            "monthly": "1mo",
+            "1mth": "1mo",
+            "mo": "1mo",
+            "d": "1d",
+            "daily": "1d",
+        }
+        return aliases.get(label, label)
+
+    def _phase1_internal_pair(self, external_label: str) -> str:
+        return PHASE1_AUTO_PAIRS.get(self._clean_timeframe_label(external_label), "1h")
+
+    def _phase1_timeframe_key(self, scope: str, label: str) -> str:
+        safe = "".join(ch for ch in self._clean_timeframe_label(label) if ch.isalnum()) or scope
+        return f"{scope}_{safe}"
+
+    def _phase1_swing_length(self, df: pd.DataFrame, requested: int) -> int:
+        requested = max(1, int(requested or 1))
+        if df.empty or len(df) > requested:
+            return requested
+        return max(1, len(df) - 1)
+
     def _prepare_df(self, candles: list[dict]) -> pd.DataFrame:
         df = pd.DataFrame(candles).reset_index(drop=True)
         if df.empty:
@@ -349,9 +421,18 @@ class StrategyEngine:
         return self._prepare_df(out[cols].to_dict("records"))
 
     def _detect_phase1_swings(self, df: pd.DataFrame, tier: str, timeframe: str, length: int) -> list[dict]:
+        """Detect swings with the same state-flip logic used by the client Pine formula.
+
+        Pine reference:
+            upper = ta.highest(len)
+            lower = ta.lowest(len)
+            os := high[len] > upper ? 0 : low[len] < lower ? 1 : os[1]
+            top = os == 0 and os[1] != 0 ? high[len] : 0
+            btm = os == 1 and os[1] != 1 ? low[len] : 0
+        """
         swings: list[dict] = []
         length = max(1, int(length))
-        if df.empty or len(df) < length * 2 + 1:
+        if df.empty or len(df) <= length:
             return swings
 
         last_high_price: Optional[float] = None
@@ -359,20 +440,24 @@ class StrategyEngine:
         highs = df["high"].astype(float).to_numpy()
         lows = df["low"].astype(float).to_numpy()
         timestamps = df["timestamp"].tolist()
+        os_prev = 0
 
-        for i in range(length, len(df) - length):
-            high = float(highs[i])
-            low = float(lows[i])
-            confirmed_after = int(i + length)
+        for current_index in range(length, len(df)):
+            pivot_index = current_index - length
+            upper = float(highs[pivot_index + 1 : current_index + 1].max())
+            lower = float(lows[pivot_index + 1 : current_index + 1].min())
+            os_current = 0 if float(highs[pivot_index]) > upper else (1 if float(lows[pivot_index]) < lower else os_prev)
+            confirmed_after = int(current_index)
 
-            if high > float(highs[i - length : i].max()) and high > float(highs[i + 1 : i + length + 1].max()):
+            if os_current == 0 and os_prev != 0:
+                high = float(highs[pivot_index])
                 label = "HH" if last_high_price is None or high > last_high_price else "LH"
                 last_high_price = high
                 swings.append(
                     {
-                        "id": f"{timeframe}:high:{i}",
-                        "index": int(i),
-                        "timestamp": timestamps[i],
+                        "id": f"{timeframe}:high:{pivot_index}",
+                        "index": int(pivot_index),
+                        "timestamp": timestamps[pivot_index],
                         "price": high,
                         "kind": "high",
                         "label": label,
@@ -380,18 +465,20 @@ class StrategyEngine:
                         "timeframe": timeframe,
                         "length": length,
                         "confirmed_after": confirmed_after,
-                        "detection_rule": f"local high with {length} candles left and right",
+                        "confirmation_timestamp": timestamps[confirmed_after],
+                        "detection_rule": "Pine swings(len) state flip: high[len] > ta.highest(len)",
                     }
                 )
 
-            if low < float(lows[i - length : i].min()) and low < float(lows[i + 1 : i + length + 1].min()):
+            if os_current == 1 and os_prev != 1:
+                low = float(lows[pivot_index])
                 label = "LL" if last_low_price is not None and low < last_low_price else "HL"
                 last_low_price = low
                 swings.append(
                     {
-                        "id": f"{timeframe}:low:{i}",
-                        "index": int(i),
-                        "timestamp": timestamps[i],
+                        "id": f"{timeframe}:low:{pivot_index}",
+                        "index": int(pivot_index),
+                        "timestamp": timestamps[pivot_index],
                         "price": low,
                         "kind": "low",
                         "label": label,
@@ -399,9 +486,12 @@ class StrategyEngine:
                         "timeframe": timeframe,
                         "length": length,
                         "confirmed_after": confirmed_after,
-                        "detection_rule": f"local low with {length} candles left and right",
+                        "confirmation_timestamp": timestamps[confirmed_after],
+                        "detection_rule": "Pine swings(len) state flip: low[len] < ta.lowest(len)",
                     }
                 )
+
+            os_prev = os_current
 
         return sorted(swings, key=lambda x: (x["index"], x["kind"]))
 
@@ -742,22 +832,11 @@ class StrategyEngine:
             body_broken = swing_id in broken_by
             produced_events = produced_by.get(swing_id, [])
             bos_produced = bool(produced_events)
-            score_ready = bool(bos_produced)
-            move_score = self._phase1_move_size_score(df, swing, median_range) if score_ready else 0.0
+            continuation_confirmed = any(bool(event.get("continuation_confirmed")) for event in produced_events)
             continuation_quality = max([float(event.get("continuation_score", 0.0) or 0.0) for event in produced_events] or [0.0])
-            structural_impact = self._phase1_timeframe_weight(timeframe) if bos_produced else 0.0
-
-            score = 0.0
-            if score_ready:
-                score = (
-                    (1.0 if liquidity_taken else 0.0) * 0.25
-                    + move_score * 0.20
-                    + (1.0 if bos_produced else 0.0) * 0.30
-                    + continuation_quality * 0.15
-                    + structural_impact * 0.10
-                )
-            score = float(round(min(max(score, 0.0), 1.0), 4))
-            strength_class = "STRUCTURAL" if score >= 0.70 else ("MAJOR" if score >= 0.40 else "MINOR")
+            is_structural = bool(bos_produced and continuation_confirmed)
+            strength_score = 1.0 if is_structural else 0.0
+            strength_class = "STRUCTURAL" if is_structural else "WEAK"
 
             role = f"WEAK_{str(swing['kind']).upper()}"
             if produced_events:
@@ -774,23 +853,16 @@ class StrategyEngine:
                     "liquidity_taken": liquidity_taken,
                     "body_broken": body_broken,
                     "bos_produced": bos_produced,
+                    "continuation_confirmed": continuation_confirmed,
                     "continuation_quality": float(round(continuation_quality, 4)),
-                    "move_size_score": float(round(move_score, 4)),
-                    "structural_impact_score": float(round(structural_impact, 4)),
-                    "strength_score": score,
-                    "score_ready": score_ready,
+                    "strength_score": strength_score,
+                    "score_ready": bos_produced,
                     "strength_class": strength_class,
                     "structure_role": role,
-                    "valid_swing": bool(liquidity_taken and bos_produced),
-                    "validation_status": "valid" if liquidity_taken and bos_produced else "pending_or_invalid",
+                    "valid_swing": is_structural,
+                    "validation_status": "structural" if is_structural else "weak_or_pending",
                     "is_active_weak": role.startswith("WEAK_") and not body_broken and not liquidity_taken,
-                    "score_weights": {
-                        "liquidity_taken": 0.25,
-                        "move_size": 0.20,
-                        "bos_produced": 0.30,
-                        "continuation_quality": 0.15,
-                        "structural_impact": 0.10,
-                    },
+                    "strength_rule": "body-close BOS/CHoCH with continuation confirmed; no weighted scoring in Phase 1",
                 }
             )
 
@@ -820,7 +892,7 @@ class StrategyEngine:
             return 1.0
         if timeframe == "daily":
             return 0.92
-        if timeframe == "external_4h":
+        if str(timeframe).startswith("external_"):
             return 0.82
         return 0.72
 
@@ -930,9 +1002,7 @@ class StrategyEngine:
         latest_event = events[-1]
         responsible_id = ((latest_event.get("responsible_structure") or {}).get("id"))
         responsible = next((s for s in swings if s.get("id") == responsible_id), None)
-        event_score = float(latest_event.get("continuation_score", 0.0) or 0.0)
-        swing_score = float((responsible or {}).get("strength_score", 0.0) or 0.0)
-        if latest_event.get("continuation_confirmed") and max(event_score, swing_score) >= 0.70:
+        if latest_event.get("continuation_confirmed"):
             return "STRUCTURAL", latest_event, responsible
         return "WEAK", latest_event, responsible
 
@@ -955,11 +1025,11 @@ class StrategyEngine:
         }
 
     def _phase1_df_for_timeframe(self, timeframe: Optional[str]) -> pd.DataFrame:
-        if timeframe == "external_4h":
+        if timeframe == self.external_timeframe_key:
             return self.external_df
-        if timeframe == "internal_1h":
+        if timeframe == self.internal_timeframe_key:
             return self.internal_df
-        return self.df
+        return self.chart_df
 
     def _is_phase1_shift_active(self, latest_shift: Optional[dict], structure_events: list[dict]) -> bool:
         if not latest_shift:
@@ -1019,9 +1089,19 @@ class StrategyEngine:
             if s.get("id")
         }
 
+        timeframe_candle_counts = {
+            "chart": len(self.chart_df),
+            "external": len(self.external_df),
+            "internal": len(self.internal_df),
+            "weekly": len(self.weekly_df),
+            "daily": len(self.daily_df),
+        }
+
         return {
             "phase": 1,
             "phase_name": "Structure Foundation",
+            "timeframe_candle_counts": timeframe_candle_counts,
+            "swing_settings": self.phase1_swing_settings,
             "trend_direction": (trend_direction or "neutral").upper(),
             "trend_timeframe": trend_timeframe,
             "trend_source": trend_source,
@@ -1078,7 +1158,7 @@ class StrategyEngine:
             "stop_hunts": self.stop_hunts,
             "rules_applied": [
                 "Trend Engine combines Weekly and Daily direction when supplied or derived",
-                "Swing Detection uses local highs/lows with N candles on both sides",
+                "Swing Detection uses TradingView-style pivot highs/lows with configurable external/internal lengths",
                 "BOS/CHoCH require candle-body close plus continuation",
                 "A strong displacement candle can confirm BOS immediately without waiting for a delayed redraw",
                 "CHoCH is only labeled when a protected high/low created a prior Shift",
@@ -1503,21 +1583,21 @@ class StrategyEngine:
             protected = invalidation if invalidation is not None else self._last_swing_price(self.external_swings, "low")
             irl = self._nearest_swing_target(self.internal_swings, "high", current)
             if erl is not None:
-                targets.append({"type": "ERL", "direction": "bullish", "level": float(erl), "timeframe": "external_4h", "label": "external buy-side liquidity target"})
+                targets.append({"type": "ERL", "direction": "bullish", "level": float(erl), "timeframe": self.external_timeframe_key, "label": "external buy-side liquidity target"})
             if irl is not None:
-                targets.append({"type": "IRL", "direction": "bullish", "level": float(irl), "timeframe": "internal_1h", "label": "internal buy-side liquidity target"})
+                targets.append({"type": "IRL", "direction": "bullish", "level": float(irl), "timeframe": self.internal_timeframe_key, "label": "internal buy-side liquidity target"})
             if protected is not None:
-                targets.append({"type": "INVALIDATION", "direction": "bullish", "level": float(protected), "timeframe": "external_4h", "label": "no buys below this protected low"})
+                targets.append({"type": "INVALIDATION", "direction": "bullish", "level": float(protected), "timeframe": self.external_timeframe_key, "label": "no buys below this protected low"})
         elif external_bias == "bearish":
             erl = external_target if external_target is not None else self._nearest_swing_target(self.external_swings, "low", current)
             protected = invalidation if invalidation is not None else self._last_swing_price(self.external_swings, "high")
             irl = self._nearest_swing_target(self.internal_swings, "low", current)
             if erl is not None:
-                targets.append({"type": "ERL", "direction": "bearish", "level": float(erl), "timeframe": "external_4h", "label": "external sell-side liquidity target"})
+                targets.append({"type": "ERL", "direction": "bearish", "level": float(erl), "timeframe": self.external_timeframe_key, "label": "external sell-side liquidity target"})
             if irl is not None:
-                targets.append({"type": "IRL", "direction": "bearish", "level": float(irl), "timeframe": "internal_1h", "label": "internal sell-side liquidity target"})
+                targets.append({"type": "IRL", "direction": "bearish", "level": float(irl), "timeframe": self.internal_timeframe_key, "label": "internal sell-side liquidity target"})
             if protected is not None:
-                targets.append({"type": "INVALIDATION", "direction": "bearish", "level": float(protected), "timeframe": "external_4h", "label": "no sells above this protected high"})
+                targets.append({"type": "INVALIDATION", "direction": "bearish", "level": float(protected), "timeframe": self.external_timeframe_key, "label": "no sells above this protected high"})
 
         targets.extend(self._equal_high_low_targets())
         targets.extend(self.trendline_liquidity)
@@ -1584,7 +1664,7 @@ class StrategyEngine:
                             "type": "RETAIL_LQ",
                             "direction": "bullish" if kind == "high" else "bearish",
                             "level": float((a["price"] + b["price"]) / 2),
-                            "timeframe": "internal_1h",
+                            "timeframe": self.internal_timeframe_key,
                             "label": label,
                         }
                     )
@@ -1631,7 +1711,7 @@ class StrategyEngine:
                                 "type": "TRENDLINE_LQ",
                                 "direction": direction,
                                 "level": float(projected_now),
-                                "timeframe": "internal_1h",
+                                "timeframe": self.internal_timeframe_key,
                                 "label": label,
                                 "source": "trendline",
                                 "kind": kind,
@@ -1648,7 +1728,7 @@ class StrategyEngine:
         return targets
 
     def _detect_session_liquidity(self) -> list[dict]:
-        if self.df.empty or "_time" not in self.df:
+        if self.chart_df.empty or "_time" not in self.chart_df:
             return []
 
         session_defs = {
@@ -2129,7 +2209,7 @@ class StrategyEngine:
             legs.append(
                 {
                     "sequence": seq,
-                    "timeframe": "internal_1h",
+                    "timeframe": self.internal_timeframe_key,
                     "start_index": start_index,
                     "end_index": end_index,
                     "start_timestamp": start["timestamp"],
@@ -2416,8 +2496,8 @@ class StrategyEngine:
         erl = next((x for x in self.liquidity_targets if x["type"] == "ERL"), None)
         return {
             "external_bias": external_bias or "neutral",
-            "external_timeframe": "4H",
-            "internal_timeframe": "1H",
+            "external_timeframe": self.external_timeframe_label,
+            "internal_timeframe": self.internal_timeframe_label,
             "active_external_range_status": active_external_range["status"] if active_external_range else "none",
             "active_external_range_direction": active_external_range["direction"] if active_external_range else None,
             "active_external_range_midpoint": active_external_range["midpoint"] if active_external_range else None,
@@ -2430,9 +2510,9 @@ class StrategyEngine:
             "candidate_pois": len(candidate_pois),
             "total_pois": len(self.pois),
             "entry_model_priority": "A ثم B ثم C",
-            "swing_model": "client_length",
-            "external_swing_length": int(self.params.get("major_length", 50)),
-            "internal_swing_length": int(self.params.get("internal_length", 20)),
+            "swing_model": "pine_swings_state_flip",
+            "external_swing_length": int(self.phase1_swing_settings.get("external_used_length", PHASE1_DEFAULT_SWING_LENGTH)),
+            "internal_swing_length": int(self.phase1_swing_settings.get("internal_used_length", PHASE1_DEFAULT_SWING_LENGTH)),
             "micro_timeframe_status": "active" if self.correction_protocols else ("no_micro_feed" if self.micro_df.empty else "waiting_for_micro_choch_bos"),
             "latest_external_swing": self.external_swings[-1] if self.external_swings else None,
             "latest_internal_swing": self.internal_swings[-1] if self.internal_swings else None,
@@ -2453,32 +2533,53 @@ class StrategyEngine:
             ],
         }
 
+    def _is_chart_timeframe(self, timeframe: str) -> bool:
+        return (
+            (timeframe == self.external_timeframe_key and self.chart_timeframe_label == self.external_timeframe_label)
+            or (timeframe == self.internal_timeframe_key and self.chart_timeframe_label == self.internal_timeframe_label)
+        )
+
     def _map_for_chart(self, records: list[dict], timeframe: str) -> list[dict]:
-        if timeframe == "internal_1h":
+        if self._is_chart_timeframe(timeframe):
             return [dict(x) for x in records]
 
         mapped: list[dict] = []
         for record in records:
             item = dict(record)
             item["source_index"] = record["index"]
-            item["index"] = self._nearest_internal_index(record["timestamp"])
+            item["index"] = self._nearest_chart_index(record["timestamp"])
+            if "confirmed_after" in record:
+                item["source_confirmed_after"] = record.get("confirmed_after")
+                confirmation_timestamp = record.get("confirmation_timestamp")
+                if confirmation_timestamp:
+                    item["confirmed_after"] = self._nearest_chart_index(confirmation_timestamp)
+            if "confirmation_index" in record:
+                item["source_confirmation_index"] = record.get("confirmation_index")
+                confirmation_timestamp = record.get("confirmation_timestamp")
+                if confirmation_timestamp:
+                    item["confirmation_index"] = self._nearest_chart_index(confirmation_timestamp)
+            if record.get("shift_index") is not None:
+                item["source_shift_index"] = record.get("shift_index")
+                shift_timestamp = record.get("shift_timestamp")
+                if shift_timestamp:
+                    item["shift_index"] = self._nearest_chart_index(shift_timestamp)
             if "swing_timestamp" in record:
                 item["swing_source_index"] = record.get("swing_index")
-                item["swing_index"] = self._nearest_internal_index(record["swing_timestamp"])
+                item["swing_index"] = self._nearest_chart_index(record["swing_timestamp"])
             mapped.append(item)
         return mapped
 
     def _map_ranges_for_chart(self, ranges: list[dict], timeframe: str) -> list[dict]:
-        if timeframe == "internal_1h":
+        if self._is_chart_timeframe(timeframe):
             return [deepcopy(x) for x in ranges]
 
         mapped: list[dict] = []
         for record in ranges:
             item = deepcopy(record)
             item["source_from_event_index"] = record.get("from_event_index")
-            item["from_event_index"] = self._nearest_internal_index(record.get("timestamp", ""))
+            item["from_event_index"] = self._nearest_chart_index(record.get("timestamp", ""))
             item["source_trigger_event_index"] = record.get("trigger_event_index")
-            item["trigger_event_index"] = self._nearest_internal_index(record.get("timestamp", ""))
+            item["trigger_event_index"] = self._nearest_chart_index(record.get("timestamp", ""))
 
             for key in ("a", "b", "c"):
                 point = item.get(key)
@@ -2487,32 +2588,32 @@ class StrategyEngine:
                 point["source_index"] = point.get("index")
                 timestamp = point.get("timestamp")
                 if timestamp:
-                    point["index"] = self._nearest_internal_index(timestamp)
+                    point["index"] = self._nearest_chart_index(timestamp)
                 if point.get("swept_at") is not None:
                     point["source_swept_at"] = point.get("swept_at")
                     sweep_timestamp = point.get("sweep_timestamp")
                     if sweep_timestamp:
-                        point["swept_at"] = self._nearest_internal_index(sweep_timestamp)
+                        point["swept_at"] = self._nearest_chart_index(sweep_timestamp)
 
             if item.get("validation_index") is not None and isinstance(item.get("b"), dict):
                 item["source_validation_index"] = item.get("validation_index")
                 sweep_timestamp = item["b"].get("sweep_timestamp")
                 if sweep_timestamp:
-                    item["validation_index"] = self._nearest_internal_index(sweep_timestamp)
+                    item["validation_index"] = self._nearest_chart_index(sweep_timestamp)
             mapped.append(item)
 
         return sorted(mapped, key=lambda x: x["from_event_index"])
 
-    def _nearest_internal_index(self, timestamp: str) -> int:
-        if self.df.empty or "_time" not in self.df:
+    def _nearest_chart_index(self, timestamp: str) -> int:
+        if self.chart_df.empty or "_time" not in self.chart_df:
             return 0
         ts = pd.to_datetime(timestamp, utc=True, errors="coerce")
         if pd.isna(ts):
             return 0
-        exact = self.df.index[self.df["_time"] == ts].tolist()
+        exact = self.chart_df.index[self.chart_df["_time"] == ts].tolist()
         if exact:
             return int(exact[0])
-        prior = self.df.index[self.df["_time"] <= ts].tolist()
+        prior = self.chart_df.index[self.chart_df["_time"] <= ts].tolist()
         if prior:
             return int(prior[-1])
         return 0

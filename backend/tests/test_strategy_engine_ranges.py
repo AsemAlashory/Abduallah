@@ -13,8 +13,8 @@ from app.services.strategy_engine import run_analysis
 
 PARAMS = {
     "n_candles": 2,
-    "major_length": 50,
-    "internal_length": 20,
+    "major_length": 2,
+    "internal_length": 2,
     "micro_length": 6,
     "break_confirmation": "close",
     "min_fvg_size": 0.0,
@@ -82,12 +82,13 @@ DIRECT_COUNTER_BREAK_WITHOUT_SHIFT = [100, 98, 96, 99, 105, 103, 101, 106, 112, 
 
 class StrategyPhaseOneTests(unittest.TestCase):
     def run_phase_one(self, prices: list[float]) -> dict:
-        internal = make_candles(prices)
+        external = make_candles(prices, hours=4)
+        internal = make_candles(prices, hours=1)
         daily = make_candles(prices, hours=24)
         return run_analysis(
-            candles=internal,
+            candles=external,
             params=PARAMS,
-            external_candles=internal,
+            external_candles=external,
             internal_candles=internal,
             daily_candles=daily,
         )
@@ -137,7 +138,7 @@ class StrategyPhaseOneTests(unittest.TestCase):
         self.assertTrue(all(event["continuation_confirmed"] for event in analysis["structure_events"]))
         self.assertTrue(
             any(swing.get("strength_class") == "STRUCTURAL" for swing in analysis["swings"]),
-            "At least one swing should be scored structural when it produces a confirmed BOS",
+            "At least one swing should be classified structural when it produces a confirmed BOS",
         )
 
     def test_phase_one_official_outputs_match_pdf_contract(self) -> None:
@@ -178,6 +179,10 @@ class StrategyPhaseOneTests(unittest.TestCase):
         self.assertIsInstance(official["swing_strength_map"], dict)
         self.assertIsInstance(official["shift_detected"], bool)
         self.assertTrue(official["latest_shift"] is None or isinstance(official["latest_shift"], dict))
+        self.assertTrue(state["swing_settings"]["feeds_separated"])
+        self.assertIn("never auto-reused", state["swing_settings"]["same_feed_guard"])
+        self.assertEqual(state["timeframe_candle_counts"]["chart"], state["timeframe_candle_counts"]["external"])
+
 
         if official["last_bos"]:
             self.assertEqual(set(official["last_bos"]), {"type", "level", "time", "direction", "index", "timeframe", "confirmed"})
@@ -200,8 +205,8 @@ class StrategyPhaseOneTests(unittest.TestCase):
         self.assertGreater(len(choch_events), 0)
         self.assertTrue(all(event.get("shift") for event in choch_events))
         self.assertTrue(all(event.get("shift_index") is not None for event in choch_events))
-        self.assertTrue(all(event["shift_index"] < event["index"] for event in choch_events))
-        self.assertTrue(all((event.get("shift") or {}).get("confirmation_index") <= event["index"] for event in choch_events))
+        self.assertTrue(all((event.get("source_shift_index", event["shift_index"]) < event.get("source_index", event["index"])) for event in choch_events))
+        self.assertTrue(all((event.get("shift") or {}).get("confirmation_index") <= event.get("source_index", event["index"]) for event in choch_events))
         self.assertTrue(state["choch_requires_shift"])
         self.assertEqual(state["official_outputs"]["latest_shift"], state["latest_shift"])
 
@@ -235,16 +240,46 @@ class StrategyPhaseOneTests(unittest.TestCase):
             self.assertIn(state["last_bos"]["timeframe"], {"external_4h", "internal_1h"})
         self.assertTrue(all(event["timeframe"] in {"external_4h", "internal_1h"} for event in state["shift_events"]))
 
-    def test_peaks_and_valleys_use_n_candles_left_and_right(self) -> None:
+    def test_peaks_and_valleys_use_pine_formula_lengths(self) -> None:
         analysis = self.run_phase_one(STRUCTURAL_PRICES)
-        market_swings = [s for s in analysis["swings"] if s["timeframe"] in {"external_4h", "internal_1h"}]
+        external_swings = [s for s in analysis["swings"] if s["timeframe"] == "external_4h"]
+        internal_swings = [s for s in analysis["swings"] if s["timeframe"] == "internal_1h"]
+        market_swings = external_swings + internal_swings
 
         self.assertGreater(len(market_swings), 0)
         self.assertTrue(any(s["kind"] == "high" for s in market_swings))
         self.assertTrue(any(s["kind"] == "low" for s in market_swings))
-        self.assertTrue(all(s["length"] == PARAMS["n_candles"] for s in market_swings))
-        self.assertTrue(all(s["confirmed_after"] == s["index"] + PARAMS["n_candles"] for s in market_swings))
-        self.assertTrue(all("local" in s["detection_rule"] for s in market_swings))
+        self.assertTrue(all(s["length"] == PARAMS["major_length"] for s in external_swings))
+        self.assertTrue(all(s["length"] == PARAMS["internal_length"] for s in internal_swings))
+        self.assertTrue(all(s.get("source_confirmed_after", s["confirmed_after"]) == s.get("source_index", s["index"]) + s["length"] for s in market_swings))
+        self.assertTrue(any(s.get("source_index") != s.get("index") for s in internal_swings))
+        self.assertTrue(all("Pine swings(len)" in s["detection_rule"] for s in market_swings))
+
+    def test_phase_one_auto_pairs_official_external_internal_timeframes(self) -> None:
+        internal = make_candles(STRUCTURAL_PRICES)
+        external = make_candles(STRUCTURAL_PRICES, hours=24 * 7)
+        daily = make_candles(STRUCTURAL_PRICES, hours=24)
+        params = {**PARAMS, "external_timeframe": "1wk", "internal_timeframe": "1d", "chart_timeframe": "1d"}
+
+        analysis = run_analysis(
+            candles=internal,
+            params=params,
+            external_candles=external,
+            internal_candles=internal,
+            daily_candles=daily,
+        )
+        state = analysis["phase_1"]
+        frames = {s["timeframe"] for s in analysis["swings"]}
+
+        self.assertIn("external_1wk", frames)
+        self.assertIn("internal_4h", frames)
+        self.assertNotIn("internal_1d", frames)
+        self.assertEqual(state["swing_settings"]["external_timeframe"], "1wk")
+        self.assertEqual(state["swing_settings"]["internal_timeframe"], "4h")
+        self.assertEqual(state["swing_settings"]["external_used_length"], PARAMS["major_length"])
+        self.assertEqual(state["swing_settings"]["internal_used_length"], PARAMS["internal_length"])
+        self.assertEqual(state["timeframe_candle_counts"]["external"], len(external))
+        self.assertEqual(state["timeframe_candle_counts"]["internal"], len(internal))
 
     def test_internal_and_external_swing_scope_contract(self) -> None:
         analysis = self.run_phase_one(REVERSAL_PRICES)
@@ -255,7 +290,7 @@ class StrategyPhaseOneTests(unittest.TestCase):
         self.assertTrue(any(s["structure_scope"] == "Internal" and not s["bos_produced"] for s in external_swings))
         self.assertFalse(any(s["structure_scope"] == "External" and not s["bos_produced"] for s in external_swings))
 
-    def test_swing_validation_requires_liquidity_and_bos_production(self) -> None:
+    def test_swing_validation_requires_confirmed_structure_continuation(self) -> None:
         analysis = self.run_phase_one(REVERSAL_PRICES)
         swings = analysis["swings"]
         valid = [s for s in swings if s.get("valid_swing")]
@@ -263,10 +298,10 @@ class StrategyPhaseOneTests(unittest.TestCase):
 
         self.assertGreater(len(valid), 0)
         self.assertGreater(len(invalid), 0)
-        self.assertTrue(all(s["liquidity_taken"] and s["bos_produced"] for s in valid))
-        self.assertTrue(all((not s["liquidity_taken"]) or (not s["bos_produced"]) for s in invalid))
+        self.assertTrue(all(s["bos_produced"] and s["continuation_confirmed"] for s in valid))
+        self.assertTrue(all((not s["bos_produced"]) or (not s["continuation_confirmed"]) for s in invalid))
 
-    def test_swing_strength_score_classes_follow_thresholds(self) -> None:
+    def test_swing_strength_classes_follow_phase_one_direct_rule(self) -> None:
         analysis = self.run_phase_one(REVERSAL_PRICES)
 
         for swing in analysis["swings"]:
@@ -275,19 +310,18 @@ class StrategyPhaseOneTests(unittest.TestCase):
             self.assertIsInstance(strength_entry, dict)
             self.assertEqual(strength_entry["score"], swing["strength_score"])
             self.assertEqual(strength_entry["class"], swing["strength_class"])
-            self.assertEqual(
-                set(swing["score_weights"]),
-                {"liquidity_taken", "move_size", "bos_produced", "continuation_quality", "structural_impact"},
-            )
-            if score >= 0.70:
+            self.assertIn(swing["strength_class"], {"STRUCTURAL", "WEAK"})
+            self.assertIn(score, {0.0, 1.0})
+            self.assertIn("no weighted scoring", swing.get("strength_rule", ""))
+            if swing["bos_produced"] and swing["continuation_confirmed"]:
                 self.assertEqual(swing["strength_class"], "STRUCTURAL")
-            elif score >= 0.40:
-                self.assertEqual(swing["strength_class"], "MAJOR")
+                self.assertEqual(score, 1.0)
             else:
-                self.assertEqual(swing["strength_class"], "MINOR")
+                self.assertEqual(swing["strength_class"], "WEAK")
+                self.assertEqual(score, 0.0)
 
         self.assertTrue(any(s["strength_class"] == "STRUCTURAL" for s in analysis["swings"]))
-        self.assertTrue(any(s["strength_class"] == "MINOR" for s in analysis["swings"]))
+        self.assertTrue(any(s["strength_class"] == "WEAK" for s in analysis["swings"]))
 
     def test_bos_updates_last_bos_and_stop_hunt_does_not(self) -> None:
         structural = self.run_phase_one(STRUCTURAL_PRICES)

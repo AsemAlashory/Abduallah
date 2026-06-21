@@ -9,7 +9,7 @@ import requests
 import yfinance as yf
 
 
-_BINANCE_INTERVALS = {"1m", "5m", "15m", "30m", "1h", "4h", "1d", "1w"}
+_BINANCE_INTERVALS = {"1m", "5m", "15m", "30m", "1h", "2h", "4h", "1d", "1w", "1M"}
 
 
 def _normalize_symbol(symbol: str) -> str:
@@ -28,6 +28,8 @@ def _period_to_limit(period: str) -> int:
         "6mo": 1000,
         "1y": 1000,
         "2y": 1000,
+        "5y": 1000,
+        "10y": 1000,
     }
     return mapping.get(period, 500)
 
@@ -35,6 +37,8 @@ def _period_to_limit(period: str) -> int:
 def _to_binance_interval(interval: str) -> str:
     if interval == "1wk":
         return "1w"
+    if interval == "1mo":
+        return "1M"
     return "1h" if interval == "60m" else interval
 
 
@@ -126,7 +130,7 @@ def _csv_rows_to_candles(df: pd.DataFrame) -> List[Dict[str, Any]]:
 
 
 def _fetch_yfinance(symbol: str, interval: str, period: str) -> List[Dict[str, Any]]:
-    yf_interval = "1h" if interval in {"4h", "60m"} else interval
+    yf_interval = "1h" if interval in {"2h", "4h", "60m"} else interval
     data = yf.download(symbol.strip(), period=period, interval=yf_interval, progress=False)
     if data.empty:
         return []
@@ -152,6 +156,8 @@ def _fetch_yfinance(symbol: str, interval: str, period: str) -> List[Dict[str, A
             }
         )
 
+    if interval == "2h":
+        return _resample_candles(candles, "2h")
     if interval == "4h":
         return _resample_candles(candles, "4h")
     return candles
@@ -217,6 +223,8 @@ def fetch_market_data(symbol: str, interval: str, period: str) -> List[Dict[str,
             }
         )
 
+    if interval == "2h" and bi == "1h":
+        return _resample_candles(candles, "2h")
     if interval == "4h" and bi == "1h":
         return _resample_candles(candles, "4h")
     return candles
