@@ -8,7 +8,7 @@ BACKEND_ROOT = Path(__file__).resolve().parents[1]
 if str(BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(BACKEND_ROOT))
 
-from app.services.strategy_engine import run_analysis
+from app.services.strategy_engine import StrategyEngine, run_analysis
 
 
 PARAMS = {
@@ -33,6 +33,23 @@ def make_candles(prices: list[float], *, hours: int = 1) -> list[dict]:
                 "high": price + 0.2,
                 "low": price - 0.2,
                 "close": price,
+                "volume": 1,
+            }
+        )
+    return candles
+
+
+def make_ohlc(rows: list[tuple[float, float, float, float]], *, hours: int = 1) -> list[dict]:
+    base = datetime(2024, 1, 1)
+    candles: list[dict] = []
+    for index, (open_, high, low, close) in enumerate(rows):
+        candles.append(
+            {
+                "timestamp": (base + timedelta(hours=index * hours)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "open": open_,
+                "high": high,
+                "low": low,
+                "close": close,
                 "volume": 1,
             }
         )
@@ -357,6 +374,48 @@ class StrategyPhaseOneTests(unittest.TestCase):
         self.assertFalse(any(event["event"] == "CHoCH" for event in events))
         self.assertEqual(analysis["phase_1"]["structure_bias"], "BULLISH")
 
+    def test_shiftless_counter_break_does_not_consume_later_choch_swing(self) -> None:
+        prices = [100, 104, 110, 106, 102, 95, 98, 94, 90, 91, 88, 90, 93, 94, 96, 94, 96.5, 97.5, 92, 94, 96.8, 98.5]
+        candles = make_candles(prices)
+        engine = StrategyEngine(candles, PARAMS, external_candles=candles, internal_candles=candles)
+        df = engine._prepare_df(candles)
+
+        def swing(kind: str, index: int, label: str, confirmed_after: int) -> dict:
+            row = df.iloc[index]
+            price = float(row["high"] if kind == "high" else row["low"])
+            return {
+                "id": f"internal_1h:{kind}:{index}",
+                "index": index,
+                "timestamp": row["timestamp"],
+                "price": price,
+                "kind": kind,
+                "label": label,
+                "tier": "internal",
+                "timeframe": "internal_1h",
+                "length": 2,
+                "confirmed_after": confirmed_after,
+                "confirmation_timestamp": df.iloc[confirmed_after]["timestamp"],
+            }
+
+        counter_high = swing("high", 14, "LH", 16)
+        swings = [
+            swing("high", 2, "HH", 4),
+            swing("low", 5, "HL", 7),
+            swing("low", 10, "LL", 12),
+            counter_high,
+            swing("low", 18, "HL", 20),
+        ]
+
+        events, stop_hunts, shifts = engine._detect_phase1_structure(df, swings, "internal_1h")
+        rejected = [item for item in stop_hunts if item.get("classification") == "invalid_counter_break_without_shift"]
+        choch = [event for event in events if event["event"] == "CHoCH" and event.get("swing_id") == counter_high["id"]]
+
+        self.assertTrue(any(item.get("swing_id") == counter_high["id"] for item in rejected))
+        self.assertGreater(len(shifts), 0)
+        self.assertGreater(len(choch), 0)
+        self.assertEqual(choch[-1]["direction"], "bullish")
+        self.assertIsNotNone(choch[-1].get("shift"))
+
     def test_weak_and_strong_high_low_outputs_are_separate_from_hh_hl_labels(self) -> None:
         analysis = self.run_phase_one(REVERSAL_PRICES)
         swings = analysis["swings"]
@@ -390,6 +449,159 @@ class StrategyPhaseOneTests(unittest.TestCase):
         self.assertEqual(weak["phase_1"]["currentLegType"], "WEAK")
         self.assertFalse(weak["phase_1"]["poi_allowed"])
         self.assertEqual(weak["pois"], [])
+
+
+class StrategyPhaseTwoTests(unittest.TestCase):
+    def phase_two_fixture(self, *, reset_before_mss: bool = False) -> tuple[StrategyEngine, list[dict], list[dict], list[dict]]:
+        rows = [
+            (100, 101, 99, 100),
+            (98, 99, 96, 97),
+            (96, 97, 95, 96),
+            (99, 100, 98, 99),
+            (103, 104, 102, 103),
+            (101, 102, 100, 101),
+            (97, 100, 94, 96),
+            (102, 103, 101, 102) if not reset_before_mss else (94, 96, 92, 93),
+            (104, 107, 103, 106),
+            (99, 100, 97, 98),
+        ]
+        candles = make_ohlc(rows)
+        engine = StrategyEngine(candles, {**PARAMS, "analysis_phase": 2}, external_candles=candles, internal_candles=candles)
+        df = engine._prepare_df(candles)
+        swing_low = {
+            "id": "internal_1h:low:2",
+            "index": 2,
+            "timestamp": df.iloc[2]["timestamp"],
+            "price": float(df.iloc[2]["low"]),
+            "kind": "low",
+            "label": "HL",
+            "tier": "internal",
+            "timeframe": "internal_1h",
+            "length": 2,
+            "confirmed_after": 3,
+            "confirmation_timestamp": df.iloc[3]["timestamp"],
+        }
+        event = {
+            "index": 8,
+            "source_index": 8,
+            "timestamp": df.iloc[8]["timestamp"],
+            "event": "BOS",
+            "direction": "bullish",
+            "broken_level": 104.0,
+            "swing_index": 4,
+            "swing_id": "internal_1h:high:4",
+            "swing_timestamp": df.iloc[4]["timestamp"],
+            "swing_label": "HH",
+            "responsible_structure": {"id": swing_low["id"], "index": 2, "price": swing_low["price"], "kind": "low"},
+            "protected_level": swing_low["price"],
+            "timeframe": "internal_1h",
+            "body_close_required": True,
+            "continuation_required": True,
+            "continuation_confirmed": True,
+            "confirmation_index": 8,
+            "confirmation_timestamp": df.iloc[8]["timestamp"],
+            "continuation_score": 0.85,
+        }
+        engine.phase_1_state = {
+            "swing_strength_map": {
+                swing_low["id"]: {
+                    "score": 0.85,
+                    "class": "STRUCTURAL",
+                    "liquidity_taken": True,
+                    "bos_produced": True,
+                    "continuation_quality": 0.85,
+                }
+            }
+        }
+        return engine, [swing_low], [event], candles
+
+    def test_phase_two_confirms_sweep_before_building_range(self) -> None:
+        engine, swings, events, _ = self.phase_two_fixture()
+        sweeps = engine._detect_phase2_sweeps(engine.df, swings, events, "internal_1h", "IRL")
+        ranges = engine._build_phase2_ranges(engine.df, sweeps, events, "internal_1h", "internal")
+
+        confirmed = [sweep for sweep in sweeps if sweep.get("confirmed_sweep")]
+        self.assertEqual(len(confirmed), 1)
+        self.assertEqual(confirmed[0]["sweep_phase"], 5)
+        self.assertEqual(confirmed[0]["sweep_state"], "CONFIRMED")
+        self.assertTrue(confirmed[0]["range_allowed"])
+        self.assertEqual(len(ranges), 1)
+        self.assertEqual(ranges[0]["status"], "ACTIVE")
+        self.assertTrue(ranges[0]["valid"])
+        self.assertIsNone(ranges[0]["b"])
+        self.assertIsNone(ranges[0]["c"])
+        self.assertAlmostEqual(ranges[0]["eq"], ranges[0]["low"] + ((ranges[0]["high"] - ranges[0]["low"]) * 0.5))
+        self.assertEqual(ranges[0]["current_zone"], "DISCOUNT")
+        self.assertTrue(ranges[0]["long_allowed"])
+        self.assertFalse(ranges[0]["short_allowed"])
+        self.assertFalse(ranges[0]["counter_trading_blocked"])
+
+    def test_phase_two_resets_if_original_direction_resumes_before_mss(self) -> None:
+        engine, swings, events, _ = self.phase_two_fixture(reset_before_mss=True)
+        sweeps = engine._detect_phase2_sweeps(engine.df, swings, events, "internal_1h", "IRL")
+        ranges = engine._build_phase2_ranges(engine.df, sweeps, events, "internal_1h", "internal")
+
+        self.assertGreater(len(sweeps), 0)
+        self.assertTrue(all(not sweep.get("confirmed_sweep") for sweep in sweeps))
+        self.assertTrue(any(sweep.get("sweep_state") == "RESET" for sweep in sweeps))
+        self.assertEqual(ranges, [])
+
+    def test_phase_two_response_keeps_phase_three_outputs_disabled(self) -> None:
+        external = make_candles(STRUCTURAL_PRICES, hours=4)
+        internal = make_candles(STRUCTURAL_PRICES, hours=1)
+        daily = make_candles(STRUCTURAL_PRICES, hours=24)
+        analysis = run_analysis(
+            candles=external,
+            params={**PARAMS, "analysis_phase": 2},
+            external_candles=external,
+            internal_candles=internal,
+            daily_candles=daily,
+        )
+
+        self.assertIn("phase_2", analysis)
+        self.assertEqual(analysis["idms"], [])
+        self.assertEqual(analysis["pois"], [])
+        self.assertEqual(analysis["setups"], [])
+        self.assertEqual(analysis["liquidity_targets"], [])
+        self.assertIn("Sweep + Range", analysis["phase_2"]["phase_name"])
+
+    def test_phase_two_state_reports_latest_range_cycle_even_when_invalid(self) -> None:
+        candles = make_candles([100, 101, 102, 101, 99])
+        engine = StrategyEngine(candles, {**PARAMS, "analysis_phase": 2}, external_candles=candles, internal_candles=candles)
+        engine.external_sweeps = []
+        engine.internal_sweeps = []
+        engine.external_ranges = [
+            {
+                "timestamp": "2024-01-01T01:00:00Z",
+                "timeframe": "external_4h",
+                "from_event_index": 1,
+                "status": "ACTIVE",
+                "valid": True,
+                "range_bias": "BULLISH",
+                "premium_zone": {"low": 101, "high": 102},
+                "discount_zone": {"low": 100, "high": 101},
+                "current_zone": "DISCOUNT",
+            }
+        ]
+        engine.ranges = [
+            {
+                "timestamp": "2024-01-01T03:00:00Z",
+                "timeframe": "internal_1h",
+                "from_event_index": 3,
+                "status": "INVALID",
+                "valid": False,
+                "range_bias": "BEARISH",
+                "premium_zone": {"low": 101, "high": 102},
+                "discount_zone": {"low": 100, "high": 101},
+                "current_zone": "EQ",
+            }
+        ]
+
+        state = engine._build_phase2_state()
+
+        self.assertEqual(state["range_status"], "INVALID")
+        self.assertFalse(state["range_valid"])
+        self.assertEqual(state["gate_status"], "blocked")
 
 
 if __name__ == "__main__":

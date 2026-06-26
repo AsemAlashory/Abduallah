@@ -14,6 +14,7 @@ class Candle(BaseModel):
 
 
 class StrategyParameters(BaseModel):
+    analysis_phase: int = Field(default=1, ge=1, le=4)
     major_length: int = Field(default=45, ge=1, le=500)
     internal_length: int = Field(default=45, ge=1, le=500)
     n_candles: int = Field(default=2, ge=1, le=20)
@@ -55,6 +56,7 @@ class AnalyzeResponse(BaseModel):
     pois: List[Dict]
     liquidity_targets: List[Dict]
     phase_1: Dict = {}
+    phase_2: Dict = {}
     stop_hunts: List[Dict] = []
     strategy_state: Dict
     setups: List[Dict]

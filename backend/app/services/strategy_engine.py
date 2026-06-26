@@ -76,11 +76,13 @@ class StrategyEngine:
         self.correction_protocols: list[dict] = []
         self.strategy_state: dict[str, Any] = {}
         self.phase_1_state: dict[str, Any] = {}
+        self.phase_2_state: dict[str, Any] = {}
 
     def run(self) -> dict:
         if self.df.empty:
             return self._empty_result()
 
+        analysis_phase = self._requested_analysis_phase()
         trend_requested_length = int(self.params.get("n_candles", self.params.get("swing_length", 2)) or 2)
         external_requested_length = int(self.params.get("major_length", PHASE1_DEFAULT_SWING_LENGTH) or PHASE1_DEFAULT_SWING_LENGTH)
         internal_requested_length = int(self.params.get("internal_length", PHASE1_DEFAULT_SWING_LENGTH) or PHASE1_DEFAULT_SWING_LENGTH)
@@ -167,24 +169,19 @@ class StrategyEngine:
         )
         self.strategy_state = self.phase_1_state
 
-        # Phase 1 owns structure and trend only. Sweep, Range, IDM, POI, ABC,
-        # and Entry are intentionally left empty for later phases.
-        self.external_sweeps = []
-        self.internal_sweeps = []
-        self.external_idms = []
-        self.idms = []
-        self.external_ranges = []
-        self.ranges = []
-        self.trendline_liquidity = []
-        self.session_liquidity = []
-        self.liquidity_targets = []
-        self.pois = []
-        self.setups = []
-        self.movement_legs = []
-        self.correction_protocols = []
+        if analysis_phase >= 2:
+            self._run_phase2()
+        else:
+            # Phase 1 owns structure and trend only. Sweep, Range, IDM, POI,
+            # ABC, and Entry are intentionally left empty for later phases.
+            self._reset_later_phase_outputs()
+            self.phase_2_state = self._empty_phase2_state("not_requested")
 
         swings = self._map_for_chart(self.external_swings, self.external_timeframe_key) + self._map_for_chart(self.internal_swings, self.internal_timeframe_key)
         events = self._map_for_chart(self.external_events, self.external_timeframe_key) + self._map_for_chart(self.internal_events, self.internal_timeframe_key)
+        sweeps = self._map_for_chart(self.external_sweeps, self.external_timeframe_key) + self._map_for_chart(self.internal_sweeps, self.internal_timeframe_key)
+        external_ranges = self._map_ranges_for_chart(self.external_ranges, self.external_timeframe_key)
+        ranges = self._map_ranges_for_chart(self.ranges, self.internal_timeframe_key)
 
         return {
             "summary": {
@@ -196,10 +193,10 @@ class StrategyEngine:
                 "active_weak_lows": len(self.phase_1_state.get("activeWeakLows", [])),
                 "structural_swings": len([s for s in swings if s.get("strength_class") == "STRUCTURAL"]),
                 "poi_allowed": 1 if self.phase_1_state.get("poi_allowed") else 0,
-                "sweeps": 0,
+                "sweeps": len(sweeps),
                 "idms": 0,
-                "external_ranges": 0,
-                "ranges": 0,
+                "external_ranges": len(external_ranges),
+                "ranges": len(ranges),
                 "pois": 0,
                 "range_authorized_pois": 0,
                 "aligned_range_authorized_pois": 0,
@@ -212,13 +209,14 @@ class StrategyEngine:
             },
             "swings": sorted(swings, key=lambda x: (x["index"], x["timeframe"])),
             "structure_events": sorted(events, key=lambda x: (x["index"], x["timeframe"])),
-            "sweeps": [],
+            "sweeps": sorted(sweeps, key=lambda x: (x["index"], x["timeframe"])),
             "idms": [],
-            "external_ranges": [],
-            "ranges": [],
+            "external_ranges": external_ranges,
+            "ranges": ranges,
             "pois": [],
             "liquidity_targets": [],
             "phase_1": self.phase_1_state,
+            "phase_2": self.phase_2_state,
             "stop_hunts": self.stop_hunts,
             "strategy_state": self.strategy_state,
             "setups": [],
@@ -281,6 +279,27 @@ class StrategyEngine:
                     "swing_strength_map": {},
                 },
             },
+            "phase_2": {
+                "phase": 2,
+                "phase_name": "Sweep + Range",
+                "enabled": False,
+                "sweep_state": "IDLE",
+                "sweep_phase": 0,
+                "confirmed_sweep": False,
+                "sweep_origin": None,
+                "range": None,
+                "range_status": "NONE",
+                "range_valid": False,
+                "premium_zone": None,
+                "discount_zone": None,
+                "current_zone": None,
+                "range_bias": "NEUTRAL",
+                "gate_status": "blocked",
+                "gate_reason": "no_market_data",
+                "sweeps": [],
+                "ranges": [],
+                "rules_applied": [],
+            },
             "stop_hunts": [],
             "strategy_state": {
                 "phase": 1,
@@ -312,6 +331,55 @@ class StrategyEngine:
             "trendline_liquidity": [],
             "session_liquidity": [],
             "correction_protocols": [],
+        }
+
+    def _requested_analysis_phase(self) -> int:
+        try:
+            phase = int(self.params.get("analysis_phase", 1) or 1)
+        except (TypeError, ValueError):
+            phase = 1
+        return max(1, min(4, phase))
+
+    def _reset_later_phase_outputs(self) -> None:
+        self.external_sweeps = []
+        self.internal_sweeps = []
+        self.external_idms = []
+        self.idms = []
+        self.external_ranges = []
+        self.ranges = []
+        self.trendline_liquidity = []
+        self.session_liquidity = []
+        self.liquidity_targets = []
+        self.pois = []
+        self.setups = []
+        self.movement_legs = []
+        self.correction_protocols = []
+
+    def _empty_phase2_state(self, reason: str) -> dict:
+        return {
+            "phase": 2,
+            "phase_name": "Sweep + Range",
+            "enabled": reason != "not_requested",
+            "sweep_state": "IDLE",
+            "sweep_phase": 0,
+            "confirmed_sweep": False,
+            "sweep_origin": None,
+            "range": None,
+            "range_status": "NONE",
+            "range_valid": False,
+            "premium_zone": None,
+            "discount_zone": None,
+            "current_zone": None,
+            "range_bias": "NEUTRAL",
+            "gate_status": "blocked",
+            "gate_reason": reason,
+            "sweeps": [],
+            "ranges": [],
+            "rules_applied": [
+                "Phase 2 starts only after Phase 1 structure/trend context exists",
+                "Range creation is blocked until Sweep Phase 5 is confirmed",
+                "IDM, Liquidity targets, POI, ABC, and Entry remain disabled until later phases",
+            ],
         }
 
     def _clean_timeframe_label(self, value: Any) -> str:
@@ -502,6 +570,7 @@ class StrategyEngine:
         bias: Optional[Direction] = None
         broken_swing_ids: set[str] = set()
         stop_hunt_keys: set[tuple[str, int]] = set()
+        shiftless_counter_break_ids: set[str] = set()
         processed_shift_swing_ids: set[str] = set()
         pending_shift: Optional[dict] = None
 
@@ -533,7 +602,11 @@ class StrategyEngine:
             return record
 
         def reject_shiftless_counter_break(swing: dict, direction: Direction, index: int, row: pd.Series) -> None:
-            key = (str(swing.get("id")), int(index))
+            swing_id = str(swing.get("id"))
+            if swing_id in shiftless_counter_break_ids:
+                return
+            shiftless_counter_break_ids.add(swing_id)
+            key = (swing_id, int(index))
             if key in stop_hunt_keys:
                 return
             stop_hunt_keys.add(key)
@@ -571,6 +644,12 @@ class StrategyEngine:
         def discard_broken_tail(candidates: list[dict]) -> None:
             while candidates and str(candidates[-1].get("id")) in broken_swing_ids:
                 candidates.pop()
+
+        def mark_consumed_breaks(candidates: list[dict], direction: Direction, close: float) -> None:
+            for candidate in candidates:
+                level = float(candidate["price"])
+                if (direction == "bullish" and level <= close) or (direction == "bearish" and level >= close):
+                    broken_swing_ids.add(str(candidate.get("id")))
 
         for i in range(len(df)):
             row = df.iloc[i]
@@ -616,7 +695,6 @@ class StrategyEngine:
                     shift_context = pending_shift if pending_shift and pending_shift.get("direction") == "bullish" else None
                     if bias not in (None, "bullish") and shift_context is None:
                         reject_shiftless_counter_break(last_high, "bullish", int(i), row)
-                        broken_swing_ids.add(last_high["id"])
                         continue
                     event_type = "BOS" if bias in (None, "bullish") else "CHoCH"
                     responsible = self._phase1_structure_point(last_low)
@@ -649,7 +727,7 @@ class StrategyEngine:
                             "shift_timestamp": shift_context.get("timestamp") if shift_context else None,
                         }
                     )
-                    broken_swing_ids.add(last_high["id"])
+                    mark_consumed_breaks(available_highs, "bullish", close)
                     bias = "bullish"
                     if pending_shift and pending_shift.get("direction") == "bearish":
                         pending_shift = None
@@ -667,7 +745,6 @@ class StrategyEngine:
                     shift_context = pending_shift if pending_shift and pending_shift.get("direction") == "bearish" else None
                     if bias not in (None, "bearish") and shift_context is None:
                         reject_shiftless_counter_break(last_low, "bearish", int(i), row)
-                        broken_swing_ids.add(last_low["id"])
                         continue
                     event_type = "BOS" if bias in (None, "bearish") else "CHoCH"
                     responsible = self._phase1_structure_point(last_high)
@@ -700,7 +777,7 @@ class StrategyEngine:
                             "shift_timestamp": shift_context.get("timestamp") if shift_context else None,
                         }
                     )
-                    broken_swing_ids.add(last_low["id"])
+                    mark_consumed_breaks(available_lows, "bearish", close)
                     bias = "bearish"
                     if pending_shift and pending_shift.get("direction") == "bullish":
                         pending_shift = None
@@ -1165,6 +1242,459 @@ class StrategyEngine:
                 "A break without continuation is classified as Stop Hunt and does not update structure",
                 "Weak Leg blocks Phase 3; Structural Leg sets poi_allowed=true",
                 "Phase 1 does not build Sweep, Range, IDM, Liquidity, POI, ABC, or Entry outputs",
+            ],
+        }
+
+    def _run_phase2(self) -> None:
+        self._reset_later_phase_outputs()
+
+        self.external_sweeps = self._detect_phase2_sweeps(
+            self.external_df,
+            self.external_swings,
+            self.external_events,
+            self.external_timeframe_key,
+            "ERL",
+        )
+        self.external_ranges = self._build_phase2_ranges(
+            self.external_df,
+            self.external_sweeps,
+            self.external_events,
+            self.external_timeframe_key,
+            "external",
+        )
+        self.internal_sweeps = self._detect_phase2_sweeps(
+            self.internal_df,
+            self.internal_swings,
+            self.internal_events,
+            self.internal_timeframe_key,
+            "IRL",
+        )
+        self.ranges = self._build_phase2_ranges(
+            self.internal_df,
+            self.internal_sweeps,
+            self.internal_events,
+            self.internal_timeframe_key,
+            "internal",
+        )
+        self._cascade_phase2_range_invalidations()
+        self.phase_2_state = self._build_phase2_state()
+        self.strategy_state = {
+            **self.phase_1_state,
+            "active_phase": 2,
+            "phase": 2,
+            "phase_name": "Sweep + Range",
+            "phase_2": self.phase_2_state,
+        }
+
+    def _detect_phase2_sweeps(
+        self,
+        df: pd.DataFrame,
+        swings: list[dict],
+        events: list[dict],
+        timeframe: str,
+        liquidity_class: str,
+    ) -> list[dict]:
+        raw_sweeps = self._detect_sweeps(df, swings, timeframe, liquidity_class)
+        if df.empty:
+            return []
+
+        sorted_events = sorted(events, key=lambda item: (int(item.get("index", 0)), str(item.get("event", ""))))
+        enriched: list[dict] = []
+        for sweep in raw_sweeps:
+            item = dict(sweep)
+            item["phase"] = 2
+            item["sweep_state"] = "POTENTIAL"
+            item["sweep_phase"] = 2
+            item["confirmed_sweep"] = False
+            item["phase_steps"] = [
+                {"phase": 1, "name": "Liquidity Grab", "status": "done", "index": item["index"]},
+                {"phase": 2, "name": "Potential Sweep", "status": "done", "index": item["index"]},
+                {"phase": 3, "name": "MSS", "status": "waiting"},
+                {"phase": 4, "name": "Structure Confirmation", "status": "waiting"},
+                {"phase": 5, "name": "CONFIRMED", "status": "waiting"},
+            ]
+            item["reset_reason"] = None
+            item["mss_event"] = None
+            item["structure_confirmation_event"] = None
+            item["structural_score"] = 0.0
+            item["structural_swing_required"] = True
+            item["range_allowed"] = False
+            item["range_block_reason"] = "awaiting_mss"
+
+            sweep_index = int(item["index"])
+            candidate_events = [
+                event
+                for event in sorted_events
+                if int(event.get("index", -1)) >= sweep_index and event.get("direction") == item["direction"]
+            ]
+            mss_event: Optional[dict] = None
+            for event in candidate_events:
+                reset_reason = self._phase2_reset_reason(df, item, sorted_events, int(event.get("index", sweep_index)))
+                if reset_reason:
+                    item["sweep_state"] = "RESET"
+                    item["sweep_phase"] = 2
+                    item["reset_reason"] = reset_reason
+                    item["range_block_reason"] = "reset_before_mss"
+                    break
+                mss_event = event
+                break
+
+            if mss_event is None:
+                if item["reset_reason"] is None:
+                    reset_reason = self._phase2_reset_reason(df, item, sorted_events, len(df) - 1)
+                    if reset_reason:
+                        item["sweep_state"] = "RESET"
+                        item["reset_reason"] = reset_reason
+                        item["range_block_reason"] = "reset_before_mss"
+                enriched.append(item)
+                continue
+
+            item["mss_event"] = deepcopy(mss_event)
+            item["sweep_state"] = "MSS"
+            item["sweep_phase"] = 3
+            item["range_block_reason"] = "awaiting_structure_confirmation"
+            item["phase_steps"][2] = {"phase": 3, "name": "MSS", "status": "done", "index": int(mss_event["index"])}
+
+            confirmation_ok = bool(mss_event.get("body_close_required") and mss_event.get("continuation_confirmed"))
+            if confirmation_ok:
+                item["structure_confirmation_event"] = deepcopy(mss_event)
+                item["sweep_state"] = "STRUCTURE_CONFIRMED"
+                item["sweep_phase"] = 4
+                item["range_block_reason"] = "awaiting_structural_swing_score"
+                item["phase_steps"][3] = {
+                    "phase": 4,
+                    "name": "Structure Confirmation",
+                    "status": "done",
+                    "index": int(mss_event.get("confirmation_index", mss_event["index"])),
+                }
+
+            structural_score = self._phase2_event_structural_score(mss_event)
+            item["structural_score"] = float(round(structural_score, 4))
+            if confirmation_ok and structural_score >= 0.70:
+                item["sweep_state"] = "CONFIRMED"
+                item["sweep_phase"] = 5
+                item["confirmed_sweep"] = True
+                item["range_allowed"] = True
+                item["range_block_reason"] = None
+                item["phase_steps"][4] = {
+                    "phase": 5,
+                    "name": "CONFIRMED",
+                    "status": "done",
+                    "index": int(mss_event.get("confirmation_index", mss_event["index"])),
+                }
+
+            enriched.append(item)
+
+        return enriched
+
+    def _phase2_original_direction(self, sweep_direction: Direction) -> Direction:
+        return "bearish" if sweep_direction == "bullish" else "bullish"
+
+    def _phase2_reset_reason(self, df: pd.DataFrame, sweep: dict, events: list[dict], end_index: int) -> Optional[str]:
+        if df.empty:
+            return "empty_market_data"
+
+        sweep_index = int(sweep.get("index", 0))
+        end_index = max(sweep_index, min(int(end_index), len(df) - 1))
+        original_direction = self._phase2_original_direction(sweep["direction"])
+
+        for event in events:
+            event_index = int(event.get("index", -1))
+            if sweep_index < event_index <= end_index and event.get("direction") == original_direction and event.get("continuation_confirmed"):
+                return "original_direction_bos_before_phase5"
+
+        sweep_price = float(sweep.get("sweep_price"))
+        closes = df["close"].astype(float).to_numpy()
+        for index in range(sweep_index + 1, end_index + 1):
+            close = float(closes[index])
+            if sweep["direction"] == "bullish" and close < sweep_price:
+                return "price_resumed_original_bearish_direction"
+            if sweep["direction"] == "bearish" and close > sweep_price:
+                return "price_resumed_original_bullish_direction"
+        return None
+
+    def _phase2_event_structural_score(self, event: dict) -> float:
+        strength_map = self.phase_1_state.get("swing_strength_map", {})
+        candidate_ids = [
+            str(((event.get("responsible_structure") or {}).get("id")) or ""),
+            str(event.get("swing_id") or ""),
+        ]
+        scores: list[float] = []
+        for swing_id in candidate_ids:
+            if not swing_id:
+                continue
+            entry = strength_map.get(swing_id) or {}
+            try:
+                scores.append(float(entry.get("score", 0.0) or 0.0))
+            except (TypeError, ValueError):
+                scores.append(0.0)
+        return max(scores or [0.0])
+
+    def _build_phase2_ranges(
+        self,
+        df: pd.DataFrame,
+        sweeps: list[dict],
+        events: list[dict],
+        timeframe: str,
+        scope: str,
+    ) -> list[dict]:
+        if df.empty:
+            return []
+
+        ranges: list[dict] = []
+        confirmed_sweeps = [sweep for sweep in sweeps if sweep.get("confirmed_sweep")]
+        for sequence, sweep in enumerate(confirmed_sweeps, start=1):
+            confirm_event = sweep.get("structure_confirmation_event") or sweep.get("mss_event")
+            if not confirm_event:
+                continue
+
+            sweep_index = int(sweep["index"])
+            confirm_index = int(confirm_event.get("confirmation_index", confirm_event.get("index", sweep_index)))
+            confirm_index = max(sweep_index, min(confirm_index, len(df) - 1))
+            window = df.iloc[sweep_index : confirm_index + 1]
+            if window.empty:
+                continue
+
+            if sweep["direction"] == "bullish":
+                a_price = float(sweep["sweep_price"])
+                confirmation_idx = int(window["high"].idxmax())
+                confirmation_extreme_price = float(df.iloc[confirmation_idx]["high"])
+            else:
+                a_price = float(sweep["sweep_price"])
+                confirmation_idx = int(window["low"].idxmin())
+                confirmation_extreme_price = float(df.iloc[confirmation_idx]["low"])
+
+            lower = float(min(a_price, confirmation_extreme_price))
+            upper = float(max(a_price, confirmation_extreme_price))
+            if upper == lower:
+                continue
+
+            midpoint = float(lower + ((upper - lower) * 0.5))
+            premium_zone = {"from": midpoint, "to": upper, "low": midpoint, "high": upper}
+            discount_zone = {"from": lower, "to": midpoint, "low": lower, "high": midpoint}
+            active_zone = discount_zone if sweep["direction"] == "bullish" else premium_zone
+            active_index = self._phase2_first_zone_touch(df, confirm_index + 1, active_zone)
+            invalid_event = self._phase2_invalidating_event(df, events, confirm_index + 1, sweep["direction"], lower, upper)
+            status = "CREATED"
+            status_index = confirm_index
+            status_timestamp = df.iloc[confirm_index]["timestamp"]
+            if active_index is not None:
+                status = "ACTIVE"
+                status_index = int(active_index)
+                status_timestamp = df.iloc[status_index]["timestamp"]
+            if invalid_event is not None:
+                status = "INVALID"
+                status_index = int(invalid_event["index"])
+                status_timestamp = invalid_event["timestamp"]
+
+            current_zone = self._phase2_current_zone(df, lower, upper)
+            is_valid = status != "INVALID"
+            long_allowed = bool(is_valid and sweep["direction"] == "bullish" and current_zone == "DISCOUNT")
+            short_allowed = bool(is_valid and sweep["direction"] == "bearish" and current_zone == "PREMIUM")
+            counter_blocked = bool(
+                is_valid
+                and (
+                    (sweep["direction"] == "bullish" and current_zone == "PREMIUM")
+                    or (sweep["direction"] == "bearish" and current_zone == "DISCOUNT")
+                )
+            )
+
+            ranges.append(
+                {
+                    "phase": 2,
+                    "sequence": sequence,
+                    "scope": scope,
+                    "timeframe": timeframe,
+                    "from_event_index": int(confirm_event["index"]),
+                    "timestamp": confirm_event["timestamp"],
+                    "direction": sweep["direction"],
+                    "range_bias": str(sweep["direction"]).upper(),
+                    "status": status,
+                    "valid": is_valid,
+                    "range_type": "phase2_confirmed_sweep_range",
+                    "low": lower,
+                    "high": upper,
+                    "eq": midpoint,
+                    "lower": lower,
+                    "upper": upper,
+                    "midpoint": midpoint,
+                    "premium_zone": premium_zone,
+                    "discount_zone": discount_zone,
+                    "current_zone": current_zone,
+                    "long_allowed": long_allowed,
+                    "short_allowed": short_allowed,
+                    "counter_trading_blocked": counter_blocked,
+                    "a": {
+                        "index": sweep_index,
+                        "timestamp": sweep["timestamp"],
+                        "price": a_price,
+                        "level": float(sweep["swept_level"]),
+                        "direction": sweep["direction"],
+                        "source": sweep["liquidity_class"],
+                        "reason": "Confirmed Sweep Origin; official Phase 2 A-point",
+                    },
+                    "b": None,
+                    "c": None,
+                    "phase3_deferred_points": {
+                        "B": "first valid IDM inside the range is intentionally deferred to Phase 3",
+                        "C": "nearest external liquidity in bias is intentionally deferred to Phase 3",
+                    },
+                    "confirmation_extreme": {
+                        "index": confirmation_idx,
+                        "timestamp": df.iloc[confirmation_idx]["timestamp"],
+                        "price": confirmation_extreme_price,
+                        "reason": "temporary Phase 2 range boundary; not the Phase 3 C-point",
+                    },
+                    "trigger_event": confirm_event.get("event"),
+                    "trigger_event_index": int(confirm_event["index"]),
+                    "validation_index": confirm_index,
+                    "validation_timestamp": df.iloc[confirm_index]["timestamp"],
+                    "last_index": len(df) - 1,
+                    "last_timestamp": df.iloc[-1]["timestamp"],
+                    "status_index": status_index,
+                    "status_timestamp": status_timestamp,
+                    "active_index": active_index,
+                    "active_timestamp": df.iloc[active_index]["timestamp"] if active_index is not None else None,
+                    "invalidating_event": invalid_event,
+                    "mitigation_blocked_until_phase3_c": True,
+                    "sweep": sweep,
+                    "mss_event": sweep.get("mss_event"),
+                    "structure_confirmation_event": confirm_event,
+                    "rule": "No range is created before Sweep Phase 5; B/C remain null until Phase 3",
+                }
+            )
+
+        return sorted(ranges, key=lambda item: (int(item["from_event_index"]), int((item.get("a") or {}).get("index", 0))))
+
+    def _phase2_first_zone_touch(self, df: pd.DataFrame, start_index: int, zone: dict) -> Optional[int]:
+        if df.empty:
+            return None
+        start = max(0, min(int(start_index), len(df)))
+        zone_low = float(min(zone["low"], zone["high"]))
+        zone_high = float(max(zone["low"], zone["high"]))
+        for index in range(start, len(df)):
+            row = df.iloc[index]
+            if float(row["low"]) <= zone_high and float(row["high"]) >= zone_low:
+                return int(index)
+        return None
+
+    def _phase2_invalidating_event(
+        self,
+        df: pd.DataFrame,
+        events: list[dict],
+        start_index: int,
+        range_direction: Direction,
+        lower: float,
+        upper: float,
+    ) -> Optional[dict]:
+        opposite = "bearish" if range_direction == "bullish" else "bullish"
+        for event in sorted(events, key=lambda item: int(item.get("index", 0))):
+            event_index = int(event.get("index", -1))
+            if event_index < start_index or event.get("direction") != opposite or not event.get("continuation_confirmed"):
+                continue
+            if df.empty or event_index >= len(df):
+                continue
+            close = float(df.iloc[event_index]["close"])
+            if (range_direction == "bullish" and close < lower) or (range_direction == "bearish" and close > upper):
+                return deepcopy(event)
+        return None
+
+    def _phase2_current_zone(self, df: pd.DataFrame, lower: float, upper: float) -> str:
+        if df.empty:
+            return "EQ"
+        close = float(df.iloc[-1]["close"])
+        midpoint = lower + ((upper - lower) * 0.5)
+        tolerance = max((upper - lower) * 0.03, 1e-9)
+        if abs(close - midpoint) <= tolerance:
+            return "EQ"
+        return "PREMIUM" if close > midpoint else "DISCOUNT"
+
+    def _cascade_phase2_range_invalidations(self) -> None:
+        invalid_external = [rng for rng in self.external_ranges if rng.get("status") == "INVALID"]
+        if not invalid_external:
+            return
+
+        for external_range in invalid_external:
+            external_time = str(external_range.get("timestamp", ""))
+            for internal_range in self.ranges:
+                if str(internal_range.get("timestamp", "")) < external_time:
+                    continue
+                internal_range["status"] = "INVALID"
+                internal_range["valid"] = False
+                internal_range["cascade_invalidated"] = True
+                internal_range["parent_invalidated_by"] = {
+                    "timeframe": external_range.get("timeframe"),
+                    "from_event_index": external_range.get("from_event_index"),
+                    "timestamp": external_range.get("timestamp"),
+                }
+
+    def _build_phase2_state(self) -> dict:
+        all_sweeps = sorted(
+            self.external_sweeps + self.internal_sweeps,
+            key=lambda item: (str(item.get("timestamp", "")), str(item.get("timeframe", "")), int(item.get("index", 0))),
+        )
+        all_ranges = sorted(
+            self.external_ranges + self.ranges,
+            key=lambda item: (str(item.get("timestamp", "")), str(item.get("timeframe", "")), int(item.get("from_event_index", 0))),
+        )
+        confirmed_sweeps = [sweep for sweep in all_sweeps if sweep.get("confirmed_sweep")]
+        latest_sweep = confirmed_sweeps[-1] if confirmed_sweeps else (all_sweeps[-1] if all_sweeps else None)
+        latest_range = all_ranges[-1] if all_ranges else None
+
+        if latest_sweep is None and latest_range is None:
+            return self._empty_phase2_state("no_sweep_context")
+
+        sweep_origin = None
+        if latest_sweep:
+            sweep_origin = {
+                "level": float(latest_sweep.get("swept_level")),
+                "price": float(latest_sweep.get("sweep_price")),
+                "time": latest_sweep.get("timestamp"),
+                "index": latest_sweep.get("index"),
+                "direction": latest_sweep.get("direction"),
+                "timeframe": latest_sweep.get("timeframe"),
+                "liquidity_class": latest_sweep.get("liquidity_class"),
+            }
+
+        return {
+            "phase": 2,
+            "phase_name": "Sweep + Range",
+            "enabled": True,
+            "sweep_state": latest_sweep.get("sweep_state") if latest_sweep else "IDLE",
+            "sweep_phase": int(latest_sweep.get("sweep_phase", 0)) if latest_sweep else 0,
+            "confirmed_sweep": bool(latest_sweep and latest_sweep.get("confirmed_sweep")),
+            "sweep_origin": sweep_origin,
+            "range": latest_range,
+            "range_status": latest_range.get("status") if latest_range else "NONE",
+            "range_valid": bool(latest_range and latest_range.get("valid")),
+            "premium_zone": latest_range.get("premium_zone") if latest_range else None,
+            "discount_zone": latest_range.get("discount_zone") if latest_range else None,
+            "current_zone": latest_range.get("current_zone") if latest_range else None,
+            "range_bias": latest_range.get("range_bias") if latest_range else "NEUTRAL",
+            "long_allowed": bool(latest_range and latest_range.get("long_allowed")),
+            "short_allowed": bool(latest_range and latest_range.get("short_allowed")),
+            "counter_trading_blocked": bool(latest_range and latest_range.get("counter_trading_blocked")),
+            "gate_status": "open" if latest_range and latest_range.get("valid") else "blocked",
+            "gate_reason": "confirmed_sweep_range_ready" if latest_range and latest_range.get("valid") else "awaiting_confirmed_sweep_range",
+            "sweeps": all_sweeps,
+            "ranges": all_ranges,
+            "counts": {
+                "sweeps": len(all_sweeps),
+                "confirmed_sweeps": len(confirmed_sweeps),
+                "ranges": len(all_ranges),
+                "valid_ranges": len([rng for rng in all_ranges if rng.get("valid")]),
+                "external_ranges": len(self.external_ranges),
+                "internal_ranges": len(self.ranges),
+            },
+            "rules_applied": [
+                "Sweep state machine: IDLE -> Grab -> Potential -> MSS -> Confirm -> CONFIRMED",
+                "Reset to IDLE when price resumes the original direction before Phase 5",
+                "Range is created only after confirmed_sweep=true and structural_score>=0.70",
+                "Phase 2 Range starts with A only; B and C are null until Phase 3",
+                "Premium/Discount/EQ are calculated from the confirmed range midpoint",
+                "Bullish + Discount allows long; Bearish + Premium allows short; counter trading is blocked",
+                "HTF invalidation cascades down to internal ranges; internal invalidation does not affect HTF",
+                "IDM, liquidity targets, POI, ABC, and Entry stay disabled in Phase 2",
             ],
         }
 
@@ -2600,6 +3130,30 @@ class StrategyEngine:
                 sweep_timestamp = item["b"].get("sweep_timestamp")
                 if sweep_timestamp:
                     item["validation_index"] = self._nearest_chart_index(sweep_timestamp)
+            elif item.get("validation_index") is not None:
+                item["source_validation_index"] = item.get("validation_index")
+                validation_timestamp = item.get("validation_timestamp") or item.get("timestamp")
+                if validation_timestamp:
+                    item["validation_index"] = self._nearest_chart_index(validation_timestamp)
+
+            for index_key, timestamp_key in (
+                ("last_index", "last_timestamp"),
+                ("status_index", "status_timestamp"),
+                ("active_index", "active_timestamp"),
+            ):
+                if item.get(index_key) is None:
+                    continue
+                item[f"source_{index_key}"] = item.get(index_key)
+                timestamp = item.get(timestamp_key)
+                if timestamp:
+                    item[index_key] = self._nearest_chart_index(timestamp)
+
+            point = item.get("confirmation_extreme")
+            if isinstance(point, dict):
+                point["source_index"] = point.get("index")
+                timestamp = point.get("timestamp")
+                if timestamp:
+                    point["index"] = self._nearest_chart_index(timestamp)
             mapped.append(item)
 
         return sorted(mapped, key=lambda x: x["from_event_index"])
