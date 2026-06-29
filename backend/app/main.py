@@ -29,6 +29,16 @@ app.add_middleware(
 )
 
 
+@app.get("/")
+def root() -> dict:
+    return {"status": "ok", "service": "smc-strategy-backend", "health": "/api/health"}
+
+
+@app.head("/")
+def root_head() -> dict:
+    return {}
+
+
 @app.get("/api/health", response_model=HealthResponse)
 def health() -> HealthResponse:
     return HealthResponse(status="ok", service="smc-strategy-backend", version="0.2.0")
