@@ -179,9 +179,15 @@ class StrategyEngine:
 
         swings = self._map_for_chart(self.external_swings, self.external_timeframe_key) + self._map_for_chart(self.internal_swings, self.internal_timeframe_key)
         events = self._map_for_chart(self.external_events, self.external_timeframe_key) + self._map_for_chart(self.internal_events, self.internal_timeframe_key)
-        sweeps = self._map_for_chart(self.external_sweeps, self.external_timeframe_key) + self._map_for_chart(self.internal_sweeps, self.internal_timeframe_key)
-        external_ranges = self._map_ranges_for_chart(self.external_ranges, self.external_timeframe_key)
-        ranges = self._map_ranges_for_chart(self.ranges, self.internal_timeframe_key)
+        all_sweeps = [
+            self._compact_sweep_payload(item)
+            for item in (self._map_for_chart(self.external_sweeps, self.external_timeframe_key) + self._map_for_chart(self.internal_sweeps, self.internal_timeframe_key))
+        ]
+        all_external_ranges = [self._compact_range_payload(item) for item in self._map_ranges_for_chart(self.external_ranges, self.external_timeframe_key)]
+        all_ranges = [self._compact_range_payload(item) for item in self._map_ranges_for_chart(self.ranges, self.internal_timeframe_key)]
+        sweeps = self._trim_sweep_payload(all_sweeps)
+        external_ranges = all_external_ranges[-40:]
+        ranges = all_ranges[-80:]
 
         return {
             "summary": {
@@ -193,10 +199,10 @@ class StrategyEngine:
                 "active_weak_lows": len(self.phase_1_state.get("activeWeakLows", [])),
                 "structural_swings": len([s for s in swings if s.get("strength_class") == "STRUCTURAL"]),
                 "poi_allowed": 1 if self.phase_1_state.get("poi_allowed") else 0,
-                "sweeps": len(sweeps),
+                "sweeps": len(all_sweeps),
                 "idms": 0,
-                "external_ranges": len(external_ranges),
-                "ranges": len(ranges),
+                "external_ranges": len(all_external_ranges),
+                "ranges": len(all_ranges),
                 "pois": 0,
                 "range_authorized_pois": 0,
                 "aligned_range_authorized_pois": 0,
@@ -1628,6 +1634,130 @@ class StrategyEngine:
                     "timestamp": external_range.get("timestamp"),
                 }
 
+    def _compact_event_payload(self, event: Optional[dict]) -> Optional[dict]:
+        if not isinstance(event, dict):
+            return None
+        keys = (
+            "index",
+            "source_index",
+            "timestamp",
+            "event",
+            "direction",
+            "broken_level",
+            "swing_index",
+            "swing_timestamp",
+            "swing_label",
+            "timeframe",
+            "confirmation",
+            "body_close_required",
+            "continuation_required",
+            "continuation_confirmed",
+            "confirmation_index",
+            "confirmation_timestamp",
+            "continuation_score",
+            "shift_detected",
+            "shift_required",
+        )
+        return {key: deepcopy(event[key]) for key in keys if key in event}
+
+    def _compact_sweep_payload(self, sweep: dict) -> dict:
+        keys = (
+            "index",
+            "source_index",
+            "timestamp",
+            "type",
+            "direction",
+            "swept_level",
+            "sweep_price",
+            "liquidity_source_index",
+            "liquidity_class",
+            "timeframe",
+            "range_point",
+            "updates_structure",
+            "reason",
+            "phase",
+            "sweep_state",
+            "sweep_phase",
+            "confirmed_sweep",
+            "structural_score",
+            "structural_swing_required",
+            "range_allowed",
+            "range_block_reason",
+            "reset_reason",
+        )
+        item = {key: deepcopy(sweep[key]) for key in keys if key in sweep}
+        if sweep.get("mss_event"):
+            item["mss_event"] = self._compact_event_payload(sweep.get("mss_event"))
+        if sweep.get("structure_confirmation_event"):
+            item["structure_confirmation_event"] = self._compact_event_payload(sweep.get("structure_confirmation_event"))
+        return item
+
+    def _trim_sweep_payload(self, sweeps: list[dict], recent_limit: int = 160) -> list[dict]:
+        if len(sweeps) <= recent_limit:
+            return sweeps
+
+        selected: dict[tuple[str, int, str], dict] = {}
+        for sweep in sweeps[-recent_limit:]:
+            selected[(str(sweep.get("timeframe", "")), int(sweep.get("index", 0)), str(sweep.get("direction", "")))] = sweep
+        for sweep in sweeps:
+            if sweep.get("confirmed_sweep") or int(sweep.get("sweep_phase", 0) or 0) >= 5:
+                selected[(str(sweep.get("timeframe", "")), int(sweep.get("index", 0)), str(sweep.get("direction", "")))] = sweep
+        return sorted(selected.values(), key=lambda item: (int(item.get("index", 0)), str(item.get("timeframe", ""))))
+
+    def _compact_range_payload(self, rng: dict) -> dict:
+        keys = (
+            "phase",
+            "sequence",
+            "scope",
+            "timeframe",
+            "source_from_event_index",
+            "from_event_index",
+            "source_trigger_event_index",
+            "trigger_event_index",
+            "timestamp",
+            "direction",
+            "range_bias",
+            "status",
+            "valid",
+            "range_type",
+            "low",
+            "high",
+            "eq",
+            "lower",
+            "upper",
+            "midpoint",
+            "premium_zone",
+            "discount_zone",
+            "current_zone",
+            "long_allowed",
+            "short_allowed",
+            "counter_trading_blocked",
+            "a",
+            "b",
+            "c",
+            "phase3_deferred_points",
+            "confirmation_extreme",
+            "trigger_event",
+            "validation_index",
+            "validation_timestamp",
+            "source_validation_index",
+            "last_index",
+            "last_timestamp",
+            "source_last_index",
+            "status_index",
+            "status_timestamp",
+            "source_status_index",
+            "active_index",
+            "active_timestamp",
+            "source_active_index",
+            "mitigation_blocked_until_phase3_c",
+            "rule",
+        )
+        item = {key: deepcopy(rng[key]) for key in keys if key in rng}
+        if rng.get("invalidating_event"):
+            item["invalidating_event"] = self._compact_event_payload(rng.get("invalidating_event"))
+        return item
+
     def _build_phase2_state(self) -> dict:
         all_sweeps = sorted(
             self.external_sweeps + self.internal_sweeps,
@@ -1664,7 +1794,8 @@ class StrategyEngine:
             "sweep_phase": int(latest_sweep.get("sweep_phase", 0)) if latest_sweep else 0,
             "confirmed_sweep": bool(latest_sweep and latest_sweep.get("confirmed_sweep")),
             "sweep_origin": sweep_origin,
-            "range": latest_range,
+            "latest_sweep": self._compact_sweep_payload(latest_sweep) if latest_sweep else None,
+            "range": self._compact_range_payload(latest_range) if latest_range else None,
             "range_status": latest_range.get("status") if latest_range else "NONE",
             "range_valid": bool(latest_range and latest_range.get("valid")),
             "premium_zone": latest_range.get("premium_zone") if latest_range else None,
@@ -1676,8 +1807,8 @@ class StrategyEngine:
             "counter_trading_blocked": bool(latest_range and latest_range.get("counter_trading_blocked")),
             "gate_status": "open" if latest_range and latest_range.get("valid") else "blocked",
             "gate_reason": "confirmed_sweep_range_ready" if latest_range and latest_range.get("valid") else "awaiting_confirmed_sweep_range",
-            "sweeps": all_sweeps,
-            "ranges": all_ranges,
+            "sweeps": [self._compact_sweep_payload(item) for item in all_sweeps[-20:]],
+            "ranges": [self._compact_range_payload(item) for item in all_ranges[-20:]],
             "counts": {
                 "sweeps": len(all_sweeps),
                 "confirmed_sweeps": len(confirmed_sweeps),
@@ -1860,13 +1991,32 @@ class StrategyEngine:
 
     def _detect_sweeps(self, df: pd.DataFrame, swings: list[dict], timeframe: str, liquidity_class: str) -> list[dict]:
         sweeps: list[dict] = []
+        confirmed_swings = sorted(swings, key=lambda item: (int(item.get("confirmed_after", 0)), int(item.get("index", 0))))
+        available_lows: list[dict] = []
+        available_highs: list[dict] = []
+        next_swing_index = 0
+
         for i in range(1, len(df)):
             row = df.iloc[i]
-            prior_swings = [s for s in swings if s["confirmed_after"] < i]
-            low_levels = [s for s in prior_swings if s["kind"] == "low" and row["low"] < s["price"] and row["close"] > s["price"]]
-            high_levels = [s for s in prior_swings if s["kind"] == "high" and row["high"] > s["price"] and row["close"] < s["price"]]
-            swept_low = max(low_levels, key=lambda x: x["confirmed_after"]) if low_levels else None
-            swept_high = max(high_levels, key=lambda x: x["confirmed_after"]) if high_levels else None
+            while next_swing_index < len(confirmed_swings) and int(confirmed_swings[next_swing_index].get("confirmed_after", 0)) < i:
+                swing = confirmed_swings[next_swing_index]
+                if swing.get("kind") == "low":
+                    available_lows.append(swing)
+                elif swing.get("kind") == "high":
+                    available_highs.append(swing)
+                next_swing_index += 1
+
+            low = float(row["low"])
+            high = float(row["high"])
+            close = float(row["close"])
+            swept_low = next(
+                (swing for swing in reversed(available_lows) if low < float(swing["price"]) and close > float(swing["price"])),
+                None,
+            )
+            swept_high = next(
+                (swing for swing in reversed(available_highs) if high > float(swing["price"]) and close < float(swing["price"])),
+                None,
+            )
 
             if swept_low:
                 sweeps.append(

@@ -1,5 +1,8 @@
-﻿Render backend upload package
-Build Command: pip install -r requirements.txt
-Start Command: uvicorn app.main:app --host 0.0.0.0 --port $PORT
-Health URL: /api/health
-Root URL / also returns ok.
+﻿Render backend deploy package - Phase 2 fast response
+
+Use on Render Web Service:
+Build command: pip install -r requirements.txt
+Start command: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+Health URL after deploy: /api/health
+
+This package reduces Phase 2 analyze response size for Hostinger/Render.
