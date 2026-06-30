@@ -223,6 +223,7 @@ class StrategyEngine:
             "liquidity_targets": [],
             "phase_1": self.phase_1_state,
             "phase_2": self.phase_2_state,
+            "state_snapshot": self.phase_2_state.get("snapshot") or {},
             "stop_hunts": self.stop_hunts,
             "strategy_state": self.strategy_state,
             "setups": [],
@@ -302,6 +303,22 @@ class StrategyEngine:
                 "range_bias": "NEUTRAL",
                 "gate_status": "blocked",
                 "gate_reason": "no_market_data",
+                "snapshot": {
+                    "index": None,
+                    "timestamp": None,
+                    "trend": "NEUTRAL",
+                    "structure": "NEUTRAL",
+                    "sweep": None,
+                    "sweep_state": "IDLE",
+                    "sweep_phase": 0,
+                    "confirmed_sweep": False,
+                    "range": None,
+                    "range_status": "NONE",
+                    "range_valid": False,
+                    "range_bias": "NEUTRAL",
+                    "zone": None,
+                },
+                "range_lifecycle": [],
                 "sweeps": [],
                 "ranges": [],
                 "rules_applied": [],
@@ -379,6 +396,22 @@ class StrategyEngine:
             "range_bias": "NEUTRAL",
             "gate_status": "blocked",
             "gate_reason": reason,
+            "snapshot": {
+                "index": len(self.df) - 1 if not self.df.empty else None,
+                "timestamp": self.df.iloc[-1]["timestamp"] if not self.df.empty else None,
+                "trend": self.phase_1_state.get("trend_direction", "NEUTRAL"),
+                "structure": self.phase_1_state.get("structure_bias", "NEUTRAL"),
+                "sweep": None,
+                "sweep_state": "IDLE",
+                "sweep_phase": 0,
+                "confirmed_sweep": False,
+                "range": None,
+                "range_status": "NONE",
+                "range_valid": False,
+                "range_bias": "NEUTRAL",
+                "zone": None,
+            },
+            "range_lifecycle": [],
             "sweeps": [],
             "ranges": [],
             "rules_applied": [
@@ -1312,6 +1345,7 @@ class StrategyEngine:
             item["sweep_state"] = "POTENTIAL"
             item["sweep_phase"] = 2
             item["confirmed_sweep"] = False
+            item["range_point"] = None
             item["phase_steps"] = [
                 {"phase": 1, "name": "Liquidity Grab", "status": "done", "index": item["index"]},
                 {"phase": 2, "name": "Potential Sweep", "status": "done", "index": item["index"]},
@@ -1380,6 +1414,7 @@ class StrategyEngine:
                 item["sweep_state"] = "CONFIRMED"
                 item["sweep_phase"] = 5
                 item["confirmed_sweep"] = True
+                item["range_point"] = "A"
                 item["range_allowed"] = True
                 item["range_block_reason"] = None
                 item["phase_steps"][4] = {
@@ -1461,13 +1496,36 @@ class StrategyEngine:
             if window.empty:
                 continue
 
+            a_price = float(sweep["sweep_price"])
             if sweep["direction"] == "bullish":
-                a_price = float(sweep["sweep_price"])
-                confirmation_idx = int(window["high"].idxmax())
+                initial_extreme_price = float(df.iloc[int(window["high"].idxmax())]["high"])
+            else:
+                initial_extreme_price = float(df.iloc[int(window["low"].idxmin())]["low"])
+
+            initial_lower = float(min(a_price, initial_extreme_price))
+            initial_upper = float(max(a_price, initial_extreme_price))
+            if initial_upper == initial_lower:
+                continue
+
+            invalid_event = self._phase2_invalidating_event(
+                df,
+                events,
+                confirm_index + 1,
+                sweep["direction"],
+                initial_lower,
+                initial_upper,
+            )
+            range_end_index = int(invalid_event["index"]) if invalid_event is not None else len(df) - 1
+            range_end_index = max(confirm_index, min(range_end_index, len(df) - 1))
+            tracking_window = df.iloc[sweep_index : range_end_index + 1]
+            if tracking_window.empty:
+                continue
+
+            if sweep["direction"] == "bullish":
+                confirmation_idx = int(tracking_window["high"].idxmax())
                 confirmation_extreme_price = float(df.iloc[confirmation_idx]["high"])
             else:
-                a_price = float(sweep["sweep_price"])
-                confirmation_idx = int(window["low"].idxmin())
+                confirmation_idx = int(tracking_window["low"].idxmin())
                 confirmation_extreme_price = float(df.iloc[confirmation_idx]["low"])
 
             lower = float(min(a_price, confirmation_extreme_price))
@@ -1479,8 +1537,7 @@ class StrategyEngine:
             premium_zone = {"from": midpoint, "to": upper, "low": midpoint, "high": upper}
             discount_zone = {"from": lower, "to": midpoint, "low": lower, "high": midpoint}
             active_zone = discount_zone if sweep["direction"] == "bullish" else premium_zone
-            active_index = self._phase2_first_zone_touch(df, confirm_index + 1, active_zone)
-            invalid_event = self._phase2_invalidating_event(df, events, confirm_index + 1, sweep["direction"], lower, upper)
+            active_index = self._phase2_first_zone_touch(df, confirm_index + 1, active_zone, range_end_index)
             status = "CREATED"
             status_index = confirm_index
             status_timestamp = df.iloc[confirm_index]["timestamp"]
@@ -1492,6 +1549,7 @@ class StrategyEngine:
                 status = "INVALID"
                 status_index = int(invalid_event["index"])
                 status_timestamp = invalid_event["timestamp"]
+            status_history = self._phase2_range_status_history(df, confirm_index, active_index, invalid_event)
 
             current_zone = self._phase2_current_zone(df, lower, upper)
             is_valid = status != "INVALID"
@@ -1549,40 +1607,95 @@ class StrategyEngine:
                         "index": confirmation_idx,
                         "timestamp": df.iloc[confirmation_idx]["timestamp"],
                         "price": confirmation_extreme_price,
-                        "reason": "temporary Phase 2 range boundary; not the Phase 3 C-point",
+                        "reason": "crawling Phase 2 range boundary; not the Phase 3 C-point",
                     },
                     "trigger_event": confirm_event.get("event"),
                     "trigger_event_index": int(confirm_event["index"]),
                     "validation_index": confirm_index,
                     "validation_timestamp": df.iloc[confirm_index]["timestamp"],
-                    "last_index": len(df) - 1,
-                    "last_timestamp": df.iloc[-1]["timestamp"],
+                    "last_index": range_end_index,
+                    "last_timestamp": df.iloc[range_end_index]["timestamp"],
                     "status_index": status_index,
                     "status_timestamp": status_timestamp,
                     "active_index": active_index,
                     "active_timestamp": df.iloc[active_index]["timestamp"] if active_index is not None else None,
                     "invalidating_event": invalid_event,
+                    "status_history": status_history,
+                    "status_path": " -> ".join(item["status"] for item in status_history),
+                    "lifecycle_model": ["CREATED", "ACTIVE", "MITIGATED", "INVALID"],
+                    "range_tracking": {
+                        "mode": "CRAWLING",
+                        "started_index": sweep_index,
+                        "started_timestamp": sweep["timestamp"],
+                        "last_tracked_index": range_end_index,
+                        "last_tracked_timestamp": df.iloc[range_end_index]["timestamp"],
+                        "ended_by": "INVALIDATING_BOS_CONTINUATION" if invalid_event else "LATEST_CANDLE",
+                    },
+                    "range_end_rule": "A stays fixed at the confirmed sweep origin; the opposite boundary follows the wave until a confirmed opposite BOS invalidates the range or until the latest candle.",
+                    "mitigated": False,
+                    "mitigation_status": "DEFERRED_UNTIL_PHASE3_C",
+                    "mitigation_index": None,
+                    "mitigation_timestamp": None,
+                    "mitigation_rule": "MITIGATED needs a Phase 3 C-point; Phase 2 keeps C null by design.",
                     "mitigation_blocked_until_phase3_c": True,
                     "sweep": sweep,
                     "mss_event": sweep.get("mss_event"),
                     "structure_confirmation_event": confirm_event,
-                    "rule": "No range is created before Sweep Phase 5; B/C remain null until Phase 3",
+                    "rule": "No range is created before Sweep Phase 5; Phase 2 range crawls with price while B/C remain null until Phase 3",
                 }
             )
 
         return sorted(ranges, key=lambda item: (int(item["from_event_index"]), int((item.get("a") or {}).get("index", 0))))
 
-    def _phase2_first_zone_touch(self, df: pd.DataFrame, start_index: int, zone: dict) -> Optional[int]:
+    def _phase2_first_zone_touch(self, df: pd.DataFrame, start_index: int, zone: dict, end_index: Optional[int] = None) -> Optional[int]:
         if df.empty:
             return None
         start = max(0, min(int(start_index), len(df)))
+        stop = len(df) if end_index is None else max(start, min(int(end_index) + 1, len(df)))
         zone_low = float(min(zone["low"], zone["high"]))
         zone_high = float(max(zone["low"], zone["high"]))
-        for index in range(start, len(df)):
+        for index in range(start, stop):
             row = df.iloc[index]
             if float(row["low"]) <= zone_high and float(row["high"]) >= zone_low:
                 return int(index)
         return None
+
+    def _phase2_range_status_history(
+        self,
+        df: pd.DataFrame,
+        confirm_index: int,
+        active_index: Optional[int],
+        invalid_event: Optional[dict],
+    ) -> list[dict]:
+        history = [
+            {
+                "status": "CREATED",
+                "index": int(confirm_index),
+                "timestamp": df.iloc[confirm_index]["timestamp"],
+                "reason": "confirmed_sweep_phase5_created_range",
+            }
+        ]
+        invalid_index = int(invalid_event["index"]) if invalid_event is not None else None
+        if active_index is not None and (invalid_index is None or int(active_index) <= invalid_index):
+            history.append(
+                {
+                    "status": "ACTIVE",
+                    "index": int(active_index),
+                    "timestamp": df.iloc[int(active_index)]["timestamp"],
+                    "reason": "first_touch_of_allowed_premium_discount_zone",
+                }
+            )
+        if invalid_event is not None:
+            history.append(
+                {
+                    "status": "INVALID",
+                    "index": invalid_index,
+                    "timestamp": invalid_event.get("timestamp"),
+                    "reason": "confirmed_opposite_bos_continuation_outside_range",
+                    "event": self._compact_event_payload(invalid_event),
+                }
+            )
+        return history
 
     def _phase2_invalidating_event(
         self,
@@ -1625,14 +1738,34 @@ class StrategyEngine:
             for internal_range in self.ranges:
                 if str(internal_range.get("timestamp", "")) < external_time:
                     continue
+                previous_status = internal_range.get("status")
+                parent_status_index = external_range.get("status_index")
+                parent_status_timestamp = external_range.get("status_timestamp") or external_range.get("timestamp")
                 internal_range["status"] = "INVALID"
                 internal_range["valid"] = False
+                internal_range["status_index"] = parent_status_index
+                internal_range["status_timestamp"] = parent_status_timestamp
                 internal_range["cascade_invalidated"] = True
                 internal_range["parent_invalidated_by"] = {
                     "timeframe": external_range.get("timeframe"),
                     "from_event_index": external_range.get("from_event_index"),
                     "timestamp": external_range.get("timestamp"),
+                    "status_index": parent_status_index,
+                    "status_timestamp": parent_status_timestamp,
                 }
+                if previous_status != "INVALID":
+                    status_history = list(internal_range.get("status_history") or [])
+                    status_history.append(
+                        {
+                            "status": "INVALID",
+                            "index": parent_status_index,
+                            "timestamp": parent_status_timestamp,
+                            "reason": "parent_htf_range_invalidated",
+                            "parent": internal_range["parent_invalidated_by"],
+                        }
+                    )
+                    internal_range["status_history"] = status_history
+                    internal_range["status_path"] = " -> ".join(str(item.get("status", "")) for item in status_history if item.get("status"))
 
     def _compact_event_payload(self, event: Optional[dict]) -> Optional[dict]:
         if not isinstance(event, dict):
@@ -1750,6 +1883,16 @@ class StrategyEngine:
             "active_index",
             "active_timestamp",
             "source_active_index",
+            "status_history",
+            "status_path",
+            "lifecycle_model",
+            "range_tracking",
+            "range_end_rule",
+            "mitigated",
+            "mitigation_status",
+            "mitigation_index",
+            "mitigation_timestamp",
+            "mitigation_rule",
             "mitigation_blocked_until_phase3_c",
             "rule",
         )
@@ -1768,7 +1911,8 @@ class StrategyEngine:
             key=lambda item: (str(item.get("timestamp", "")), str(item.get("timeframe", "")), int(item.get("from_event_index", 0))),
         )
         confirmed_sweeps = [sweep for sweep in all_sweeps if sweep.get("confirmed_sweep")]
-        latest_sweep = confirmed_sweeps[-1] if confirmed_sweeps else (all_sweeps[-1] if all_sweeps else None)
+        latest_sweep = confirmed_sweeps[-1] if confirmed_sweeps else None
+        latest_candidate_sweep = all_sweeps[-1] if all_sweeps else None
         latest_range = all_ranges[-1] if all_ranges else None
 
         if latest_sweep is None and latest_range is None:
@@ -1786,6 +1930,8 @@ class StrategyEngine:
                 "liquidity_class": latest_sweep.get("liquidity_class"),
             }
 
+        snapshot = self._build_phase2_snapshot(latest_sweep, latest_range)
+
         return {
             "phase": 2,
             "phase_name": "Sweep + Range",
@@ -1795,6 +1941,9 @@ class StrategyEngine:
             "confirmed_sweep": bool(latest_sweep and latest_sweep.get("confirmed_sweep")),
             "sweep_origin": sweep_origin,
             "latest_sweep": self._compact_sweep_payload(latest_sweep) if latest_sweep else None,
+            "latest_candidate_sweep": self._compact_sweep_payload(latest_candidate_sweep) if latest_candidate_sweep else None,
+            "pending_sweep_state": latest_candidate_sweep.get("sweep_state") if latest_candidate_sweep and not latest_candidate_sweep.get("confirmed_sweep") else None,
+            "pending_sweep_phase": int(latest_candidate_sweep.get("sweep_phase", 0)) if latest_candidate_sweep and not latest_candidate_sweep.get("confirmed_sweep") else None,
             "range": self._compact_range_payload(latest_range) if latest_range else None,
             "range_status": latest_range.get("status") if latest_range else "NONE",
             "range_valid": bool(latest_range and latest_range.get("valid")),
@@ -1807,6 +1956,9 @@ class StrategyEngine:
             "counter_trading_blocked": bool(latest_range and latest_range.get("counter_trading_blocked")),
             "gate_status": "open" if latest_range and latest_range.get("valid") else "blocked",
             "gate_reason": "confirmed_sweep_range_ready" if latest_range and latest_range.get("valid") else "awaiting_confirmed_sweep_range",
+            "snapshot": snapshot,
+            "synchronized_snapshot": snapshot,
+            "range_lifecycle": latest_range.get("status_history") if latest_range else [],
             "sweeps": [self._compact_sweep_payload(item) for item in all_sweeps[-20:]],
             "ranges": [self._compact_range_payload(item) for item in all_ranges[-20:]],
             "counts": {
@@ -1822,11 +1974,37 @@ class StrategyEngine:
                 "Reset to IDLE when price resumes the original direction before Phase 5",
                 "Range is created only after confirmed_sweep=true and structural_score>=0.70",
                 "Phase 2 Range starts with A only; B and C are null until Phase 3",
+                "Phase 2 Range boundary crawls with price until confirmed opposite BOS invalidates it",
+                "MITIGATED is deferred until Phase 3 because Phase 2 intentionally keeps C null",
                 "Premium/Discount/EQ are calculated from the confirmed range midpoint",
                 "Bullish + Discount allows long; Bearish + Premium allows short; counter trading is blocked",
                 "HTF invalidation cascades down to internal ranges; internal invalidation does not affect HTF",
                 "IDM, liquidity targets, POI, ABC, and Entry stay disabled in Phase 2",
             ],
+        }
+
+    def _build_phase2_snapshot(self, latest_sweep: Optional[dict], latest_range: Optional[dict]) -> dict:
+        snapshot_index = len(self.df) - 1 if not self.df.empty else None
+        snapshot_timestamp = self.df.iloc[snapshot_index]["timestamp"] if snapshot_index is not None else None
+        phase_one = self.phase_1_state or {}
+        return {
+            "index": snapshot_index,
+            "timestamp": snapshot_timestamp,
+            "trend": phase_one.get("trend_direction", "NEUTRAL"),
+            "structure": phase_one.get("structure_bias", "NEUTRAL"),
+            "last_bos": self._compact_event_payload(phase_one.get("last_bos")) if isinstance(phase_one.get("last_bos"), dict) else None,
+            "sweep": self._compact_sweep_payload(latest_sweep) if latest_sweep else None,
+            "sweep_state": latest_sweep.get("sweep_state") if latest_sweep else "IDLE",
+            "sweep_phase": int(latest_sweep.get("sweep_phase", 0)) if latest_sweep else 0,
+            "confirmed_sweep": bool(latest_sweep and latest_sweep.get("confirmed_sweep")),
+            "range": self._compact_range_payload(latest_range) if latest_range else None,
+            "range_status": latest_range.get("status") if latest_range else "NONE",
+            "range_valid": bool(latest_range and latest_range.get("valid")),
+            "range_bias": latest_range.get("range_bias") if latest_range else "NEUTRAL",
+            "zone": latest_range.get("current_zone") if latest_range else None,
+            "premium_zone": latest_range.get("premium_zone") if latest_range else None,
+            "discount_zone": latest_range.get("discount_zone") if latest_range else None,
+            "note": "Single synchronized end-of-analysis snapshot for Trend, Structure, Sweep, Range, and Zone.",
         }
 
     def _detect_swings(self, df: pd.DataFrame, tier: str, timeframe: str, length: int) -> list[dict]:
@@ -2031,7 +2209,7 @@ class StrategyEngine:
                         "liquidity_source_index": swept_low["index"],
                         "liquidity_class": liquidity_class,
                         "timeframe": timeframe,
-                        "range_point": "A",
+                        "range_point": None,
                         "updates_structure": False,
                         "reason": "wick swept a confirmed structural liquidity level and closed back inside; structure remains unchanged",
                     }
@@ -2050,7 +2228,7 @@ class StrategyEngine:
                         "liquidity_source_index": swept_high["index"],
                         "liquidity_class": liquidity_class,
                         "timeframe": timeframe,
-                        "range_point": "A",
+                        "range_point": None,
                         "updates_structure": False,
                         "reason": "wick swept a confirmed structural liquidity level and closed back inside; structure remains unchanged",
                     }
@@ -3304,6 +3482,16 @@ class StrategyEngine:
                 timestamp = point.get("timestamp")
                 if timestamp:
                     point["index"] = self._nearest_chart_index(timestamp)
+
+            history = item.get("status_history")
+            if isinstance(history, list):
+                for step in history:
+                    if not isinstance(step, dict):
+                        continue
+                    step["source_index"] = step.get("index")
+                    timestamp = step.get("timestamp")
+                    if timestamp:
+                        step["index"] = self._nearest_chart_index(timestamp)
             mapped.append(item)
 
         return sorted(mapped, key=lambda x: x["from_event_index"])

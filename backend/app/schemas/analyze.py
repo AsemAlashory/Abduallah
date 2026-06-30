@@ -57,6 +57,7 @@ class AnalyzeResponse(BaseModel):
     liquidity_targets: List[Dict]
     phase_1: Dict = {}
     phase_2: Dict = {}
+    state_snapshot: Dict = {}
     stop_hunts: List[Dict] = []
     strategy_state: Dict
     setups: List[Dict]
