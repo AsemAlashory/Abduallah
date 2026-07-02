@@ -152,9 +152,11 @@ class StrategyEngine:
         self.phase1_shift_events.extend(external_shifts + internal_shifts)
         self.stop_hunts = external_stop_hunts + internal_stop_hunts
 
-        structure_bias = self._derive_phase1_bias(self.external_df, self.external_swings, self.external_events)
+        external_structure_bias = self._derive_phase1_bias(self.external_df, self.external_swings, self.external_events)
+        internal_structure_bias = self._derive_phase1_bias(self.internal_df, self.internal_swings, self.internal_events)
+        structure_bias = external_structure_bias
         if structure_bias is None:
-            structure_bias = self._derive_phase1_bias(self.internal_df, self.internal_swings, self.internal_events)
+            structure_bias = internal_structure_bias
 
         self._score_phase1_swings(self.external_swings, self.external_df, self.external_events, self.external_timeframe_key)
         self._score_phase1_swings(self.internal_swings, self.internal_df, self.internal_events, self.internal_timeframe_key)
@@ -163,6 +165,8 @@ class StrategyEngine:
         self.phase_1_state = self._build_phase1_state(
             trend_direction=trend_direction,
             structure_bias=structure_bias,
+            external_structure_bias=external_structure_bias,
+            internal_structure_bias=internal_structure_bias,
             trend_timeframe=trend_timeframe,
             trend_source=trend_source,
             trend_components=trend_components,
@@ -1167,10 +1171,26 @@ class StrategyEngine:
         confirmation_index = int(latest_shift.get("confirmation_index", latest_shift.get("index", len(df) - 1)))
         return 0 <= (len(df) - 1 - confirmation_index) <= valid_bars
 
+    def _phase1_structure_status(self, bias: Optional[Direction]) -> str:
+        if bias == "bullish":
+            return "BULLISH"
+        if bias == "bearish":
+            return "BEARISH"
+        return "RANGE"
+
+    def _phase1_structure_alignment(self, external_structure: str, internal_structure: str) -> str:
+        if external_structure == "RANGE" or internal_structure == "RANGE":
+            return "NEUTRAL"
+        if external_structure == internal_structure:
+            return "ALIGNED"
+        return "CONFLICT"
+
     def _build_phase1_state(
         self,
         trend_direction: Optional[Direction],
         structure_bias: Optional[Direction],
+        external_structure_bias: Optional[Direction],
+        internal_structure_bias: Optional[Direction],
         trend_timeframe: str,
         trend_source: str,
         trend_components: Optional[list[dict]] = None,
@@ -1212,6 +1232,9 @@ class StrategyEngine:
             "weekly": len(self.weekly_df),
             "daily": len(self.daily_df),
         }
+        current_external_structure = self._phase1_structure_status(external_structure_bias)
+        current_internal_structure = self._phase1_structure_status(internal_structure_bias)
+        structure_alignment = self._phase1_structure_alignment(current_external_structure, current_internal_structure)
 
         return {
             "phase": 1,
@@ -1223,6 +1246,9 @@ class StrategyEngine:
             "trend_source": trend_source,
             "trend_components": trend_components or [],
             "structure_bias": (structure_bias or "neutral").upper(),
+            "current_external_structure": current_external_structure,
+            "current_internal_structure": current_internal_structure,
+            "structure_alignment": structure_alignment,
             "last_bos": last_bos_output,
             "last_bos_event": last_bos,
             "current_external_swing": current_external_swing,
